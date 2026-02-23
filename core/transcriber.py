@@ -14,14 +14,16 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from pydub import AudioSegment
+import torch
 import whisper
 
 DEFAULT_MODEL_SIZE = "base"
 CHUNK_DURATION_SECONDS = 300  # 每段 5 分钟，兼顾稳定性与性能
 FILE_SIZE_LIMIT_MB = 25
+_MODEL_CACHE: Dict[Tuple[str, str], whisper.Whisper] = {}
 
 
 def audio_to_text(
@@ -30,6 +32,7 @@ def audio_to_text(
     language: Optional[str] = None,
     chunk_duration_sec: int = CHUNK_DURATION_SECONDS,
     file_size_limit_mb: int = FILE_SIZE_LIMIT_MB,
+    device: Optional[str] = None,
 ) -> str:
     """
     将音频文件转录为文本（离线 Whisper）。
@@ -40,6 +43,7 @@ def audio_to_text(
         language: 可选语言代码，None 时交由 Whisper 自动检测。
         chunk_duration_sec: 切片时长阈值（秒），超过则分片转录。
         file_size_limit_mb: 文件大小阈值（MB），超过则分片转录。
+        device: 推理设备（'cuda'/'mps'/'cpu'），None 时自动选择。
 
     Returns:
         逐字稿文本（去除首尾空白）。
@@ -53,7 +57,8 @@ def audio_to_text(
         raise FileNotFoundError(f"音频文件不存在：{path}")
 
     try:
-        model = whisper.load_model(model_size)
+        resolved_device = _auto_device(device)
+        model = _load_model_cached(model_size, resolved_device)
         audio = AudioSegment.from_file(path)
 
         needs_chunk = (
@@ -92,3 +97,33 @@ def _split_audio(audio: AudioSegment, chunk_duration_sec: int) -> List[AudioSegm
         for start in range(0, total_ms, chunk_ms)
     ]
 
+
+def _auto_device(user_choice: Optional[str]) -> str:
+    """
+    自动推断可用设备。优先级：用户指定 > CUDA > MPS > CPU。
+    """
+    if user_choice:
+        return user_choice
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _load_model_cached(model_size: str, device: str) -> whisper.Whisper:
+    """基于 (模型大小, 设备) 进行缓存，避免重复加载耗时。"""
+    key = (model_size, device)
+    cached = _MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        model = whisper.load_model(model_size, device=device)
+    except NotImplementedError:
+        if device != "cpu":
+            model = whisper.load_model(model_size, device="cpu")
+            key = (model_size, "cpu")
+        else:
+            raise
+    _MODEL_CACHE[key] = model
+    return model
