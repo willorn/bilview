@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from yt_dlp import YoutubeDL
+from utils.file_helper import ensure_dir
 
 DOWNLOAD_DIR_NAME = "downloads"
 PREFERRED_CODEC = "m4a"
@@ -46,8 +47,7 @@ def download_audio(
     Raises:
         RuntimeError: 下载或后处理失败时抛出异常。
     """
-    target_dir = Path(download_dir).expanduser().resolve()
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = ensure_dir(download_dir)
 
     ydl_opts = _build_options(target_dir, cookie_file)
 
@@ -108,4 +108,3 @@ def sanitize_title(title: str) -> str:
     """
     cleaned = re.sub(INVALID_FILENAME_CHARS, "_", title)
     return cleaned.strip("._") or "audio"
-
