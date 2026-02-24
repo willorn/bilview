@@ -51,6 +51,12 @@ downloads/            # 音频缓存目录（已忽略）
 - 转写默认使用 Whisper tiny、中文语言，超 25MB 或 5 分钟自动分片。  
 - LLM 调用全局 20s 速率限制，超时/错误将把任务标记为失败。
 
+### 移动端访问
+- 可在本机/服务器运行后用手机浏览器访问，命令示例：  
+  `streamlit run app.py --server.address 0.0.0.0 --server.port 8501`  
+  然后在同一局域网手机浏览器打开 `http://<电脑IP>:8501`。远程则需放行端口或使用内网穿透（frp/ngrok 等）。
+- Streamlit 对窄屏会自动折叠为单列布局；下载按钮在手机上可直接保存文件。
+
 ### 配置要点
 - `.env`：`X666_API_KEY`（优先）  
 - `config.py`：`DEFAULT_LLM_API_URL`、`DEFAULT_LLM_MODEL`、`DB_PATH`、`DOWNLOAD_DIR` 等集中管理。  
