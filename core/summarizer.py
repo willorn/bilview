@@ -23,7 +23,7 @@ from config import DEFAULT_LLM_API_URL, DEFAULT_LLM_MODEL, X666_API_KEY
 
 DEFAULT_API_URL = DEFAULT_LLM_API_URL
 DEFAULT_MODEL = DEFAULT_LLM_MODEL
-DEFAULT_API_KEY = "sk-pR6ZsovTS0l7DWlPl1sEl6Pf8duPCJO8poO7tiWrwPHO91cX"
+DEFAULT_API_KEY = None  # 不再内置默认密钥，必须由环境变量或显式传入
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TIMEOUT_SECONDS = 150
 RATE_LIMIT_SECONDS = 20
@@ -75,6 +75,8 @@ def generate_summary(
         "temperature": temperature,
     }
     chosen_key = api_key or _get_env_key() or DEFAULT_API_KEY
+    if not chosen_key:
+        raise RuntimeError("缺少 API Key：请设置环境变量 X666_API_KEY 或在调用时显式传入。")
     _respect_rate_limit()
     return _call_api(payload, chosen_key, timeout, api_url)
 
