@@ -85,3 +85,7 @@ downloads/            # 音频缓存目录（已忽略）
 - 如需 GPU/MPS 加速，安装对应的 `torch` 版本；代码会自动选择可用设备并在不支持时回退 CPU。  
 - 若需更高精度，可将 `model_size` 调为 `small/base/medium`，性能与显存占用相应上升。  
 - 若需更复杂的限流/重试策略，可在 `core/summarizer.py` 扩展。 
+
+### 架构与流程图
+- 查看详细架构说明： [docs/architecture.md](docs/architecture.md)
+
