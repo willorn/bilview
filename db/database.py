@@ -43,6 +43,7 @@ class Task:
     id: int
     bilibili_url: str
     video_title: str
+    video_duration_seconds: Optional[int]
     audio_file_path: Optional[str]
     transcript_text: Optional[str]
     summary_text: Optional[str]
@@ -56,6 +57,7 @@ class Task:
             id=row["id"],
             bilibili_url=row["bilibili_url"],
             video_title=row["video_title"],
+            video_duration_seconds=row["video_duration_seconds"],
             audio_file_path=row["audio_file_path"],
             transcript_text=row["transcript_text"],
             summary_text=row["summary_text"],
@@ -79,6 +81,7 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bilibili_url TEXT NOT NULL,
                 video_title TEXT NOT NULL,
+                video_duration_seconds INTEGER,
                 audio_file_path TEXT,
                 transcript_text TEXT,
                 summary_text TEXT,
@@ -90,11 +93,13 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
             """
         )
         connection.commit()
+        _ensure_extra_columns(connection)
 
 
 def create_task(
     bilibili_url: str,
     video_title: str,
+    video_duration_seconds: Optional[int] = None,
     audio_file_path: Optional[str] = None,
     status: str = TaskStatus.WAITING.value,
     db_path: Path | str = DEFAULT_DB_PATH,
@@ -105,6 +110,7 @@ def create_task(
     Args:
         bilibili_url: B站原始链接。
         video_title: 视频标题。
+        video_duration_seconds: 视频时长（秒）。
         audio_file_path: 本地音频文件相对路径。
         status: 任务初始状态，默认为 waiting。
         db_path: 数据库文件路径。
@@ -117,14 +123,15 @@ def create_task(
         cursor = connection.execute(
             """
             INSERT INTO tasks (
-                bilibili_url, video_title, audio_file_path,
+                bilibili_url, video_title, video_duration_seconds, audio_file_path,
                 transcript_text, summary_text, status
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 bilibili_url,
                 video_title,
+                video_duration_seconds,
                 audio_file_path,
                 None,
                 None,
@@ -155,6 +162,8 @@ def update_task_content(
     transcript_text: Optional[str] = None,
     summary_text: Optional[str] = None,
     audio_file_path: Optional[str] = None,
+    video_title: Optional[str] = None,
+    video_duration_seconds: Optional[int] = None,
     db_path: Path | str = DEFAULT_DB_PATH,
 ) -> None:
     """
@@ -165,6 +174,8 @@ def update_task_content(
         transcript_text: 逐字稿文本。
         summary_text: 总结文本。
         audio_file_path: 音频文件相对路径。
+        video_title: 视频标题（可更新）。
+        video_duration_seconds: 视频时长（秒）。
         db_path: 数据库文件路径。
     """
     fields: Dict[str, Any] = {}
@@ -174,6 +185,10 @@ def update_task_content(
         fields["summary_text"] = summary_text
     if audio_file_path is not None:
         fields["audio_file_path"] = audio_file_path
+    if video_title is not None:
+        fields["video_title"] = video_title
+    if video_duration_seconds is not None:
+        fields["video_duration_seconds"] = video_duration_seconds
     _update_fields(task_id, fields, db_path)
 
 
@@ -191,7 +206,7 @@ def get_task(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> Optional[Ta
     with get_connection(db_path) as connection:
         cursor = connection.execute(
             """
-            SELECT id, bilibili_url, video_title, audio_file_path,
+            SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
                    transcript_text, summary_text, status, created_at
             FROM tasks
             WHERE id = ?
@@ -216,7 +231,7 @@ def list_tasks(
         Task 对象列表。
     """
     sql = """
-    SELECT id, bilibili_url, video_title, audio_file_path,
+    SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
            transcript_text, summary_text, status, created_at
     FROM tasks
     ORDER BY datetime(created_at) DESC
@@ -243,6 +258,46 @@ def delete_task(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> None:
     with get_connection(db_path) as connection:
         connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         connection.commit()
+
+
+def delete_tasks_before(days: int, db_path: Path | str = DEFAULT_DB_PATH) -> int:
+    """
+    删除早于指定天数的任务，返回删除条数。
+
+    Args:
+        days: 天数阈值（>0）。
+        db_path: 数据库文件路径。
+    """
+    if days <= 0:
+        return 0
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            "DELETE FROM tasks WHERE created_at < datetime('now', ?)",
+            (f"-{int(days)} days",),
+        )
+        connection.commit()
+        return cursor.rowcount
+
+
+def delete_tasks_by_status(
+    statuses: List[str], db_path: Path | str = DEFAULT_DB_PATH
+) -> int:
+    """
+    按状态批量删除任务，返回删除条数。
+
+    Args:
+        statuses: 需删除的状态列表。
+        db_path: 数据库文件路径。
+    """
+    if not statuses:
+        return 0
+    placeholders = ",".join("?" for _ in statuses)
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            f"DELETE FROM tasks WHERE status IN ({placeholders})", tuple(statuses)
+        )
+        connection.commit()
+        return cursor.rowcount
 
 
 @contextmanager
@@ -285,6 +340,8 @@ def _update_fields(
         "audio_file_path",
         "transcript_text",
         "summary_text",
+        "video_title",
+        "video_duration_seconds",
         "status",
     }
     invalid_fields = set(fields.keys()) - allowed_fields
@@ -315,3 +372,11 @@ def _validate_status(status: str) -> str:
     if status not in TaskStatus.values():
         raise ValueError(f"非法状态值: {status}，合法取值: {TaskStatus.values()}")
     return status
+
+
+def _ensure_extra_columns(connection: sqlite3.Connection) -> None:
+    """为旧表补充新增列，避免因 schema 变更导致异常。"""
+    cursor = connection.execute("PRAGMA table_info(tasks);")
+    existing = {row["name"] for row in cursor.fetchall()}
+    if "video_duration_seconds" not in existing:
+        connection.execute("ALTER TABLE tasks ADD COLUMN video_duration_seconds INTEGER;")

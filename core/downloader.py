@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 from yt_dlp import YoutubeDL
 from utils.file_helper import ensure_dir
@@ -32,7 +32,8 @@ def download_audio(
     url: str,
     download_dir: Path | str = DEFAULT_DOWNLOAD_DIR,
     cookie_file: Optional[Path | str] = DEFAULT_COOKIE_FILE,
-) -> Path:
+    return_info: bool = False,
+) -> Union[Path, Tuple[Path, dict]]:
     """
     下载指定 B 站链接的音频流并返回本地文件路径。
 
@@ -40,9 +41,10 @@ def download_audio(
         url: B 站视频链接。
         download_dir: 音频保存目录，默认使用项目根目录下 downloads/。
         cookie_file: 可选的 cookie 文件路径，用于会员或受限视频。
+        return_info: True 时同时返回 yt-dlp 抽取的 info 字典。
 
     Returns:
-        下载完成后的音频文件绝对路径。
+        下载完成后的音频文件绝对路径；若 return_info=True，则返回 (路径, info)。
 
     Raises:
         RuntimeError: 下载或后处理失败时抛出异常。
@@ -57,7 +59,7 @@ def download_audio(
             # yt-dlp 会在后处理阶段将扩展名替换为首选编解码格式
             raw_path = Path(ydl.prepare_filename(info))
             final_path = raw_path.with_suffix(f".{PREFERRED_CODEC}")
-            return final_path
+            return (final_path, info) if return_info else final_path
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"音频下载失败：{exc}") from exc
 
