@@ -28,3 +28,11 @@ def get_api_key(env_name: str, default: Optional[str] = None) -> Optional[str]:
 
 # 项目内默认使用的 key（可在 .env 中覆盖）
 X666_API_KEY = get_api_key("X666_API_KEY")
+
+
+def ensure_api_key_present() -> None:
+    """启动时校验 API Key 是否存在，缺失则抛出友好异常。"""
+    if not X666_API_KEY:
+        raise RuntimeError(
+            "缺少 X666_API_KEY，请在 .env 中配置或设置环境变量。"
+        )

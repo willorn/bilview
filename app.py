@@ -15,7 +15,7 @@ import streamlit as st
 from yt_dlp import YoutubeDL
 
 from utils.network import get_lan_addresses
-from config import DOWNLOAD_DIR
+from config import DOWNLOAD_DIR, ensure_api_key_present
 from core.downloader import download_audio
 from core.summarizer import generate_summary
 from core.transcriber import audio_to_text
@@ -46,6 +46,11 @@ STATUS_MAP = {
 
 def main() -> None:
     st.set_page_config(page_title="B站音频转写助手", layout="wide")
+    try:
+        ensure_api_key_present()
+    except Exception as exc:  # noqa: BLE001
+        st.error(str(exc))
+        return
     init_db()
     ensure_dir(DOWNLOAD_DIR)
 
