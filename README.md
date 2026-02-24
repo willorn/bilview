@@ -22,6 +22,7 @@ db/
   database.py         # SQLite 封装（init/CRUD）
 utils/
   file_helper.py      # 目录与文件工具
+  network.py          # 局域网地址获取
 data/                 # SQLite 存放目录（已忽略）
 downloads/            # 音频缓存目录（已忽略）
 ```

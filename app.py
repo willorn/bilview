@@ -13,6 +13,7 @@ from typing import Optional
 
 import streamlit as st
 
+from utils.network import get_lan_addresses
 from config import DOWNLOAD_DIR
 from core.downloader import download_audio
 from core.summarizer import generate_summary
@@ -51,6 +52,8 @@ def main() -> None:
 
     st.title("Bilibili 视频转录与总结")
     st.caption("输入 B 站链接，一键完成下载、转写、总结。")
+
+    _render_copy_address()
 
     col_input, col_action = st.columns([4, 1], vertical_alignment="bottom")
     with col_input:
@@ -231,6 +234,19 @@ def _format_duration(seconds: Optional[int]) -> str:
     if h:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def _render_copy_address() -> None:
+    addrs = get_lan_addresses()
+    if not addrs:
+        return
+    port = st.session_state.get("server_port", 8501)
+    options = [f"http://{addr}:{port}" for addr in addrs]
+    selected = options[0]
+    if len(options) > 1:
+        selected = st.selectbox("可用局域网地址", options, label_visibility="collapsed")
+    st.code(selected, language="text")
+    st.caption("提示：手机需与本机同一局域网；如无法访问，请检查防火墙/端口。")
 
 
 _DEFAULT_PROMPT = """你是一个专业的长视频笔记助手，请将输入的完整转录文本，提炼为结构化笔记，需包含：
