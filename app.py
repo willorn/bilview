@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 import streamlit as st
+from yt_dlp import YoutubeDL
 
 from utils.network import get_lan_addresses
 from config import DOWNLOAD_DIR
@@ -19,6 +20,7 @@ from core.downloader import download_audio
 from core.summarizer import generate_summary
 from core.transcriber import audio_to_text
 from db.database import (
+    DEFAULT_DB_PATH,
     Task,
     TaskStatus,
     create_task,
@@ -136,13 +138,20 @@ def _render_history() -> None:
         st.write("暂无记录")
         return
 
-    options = {f"#{t.id} | {STATUS_MAP.get(t.status, t.status)} | {t.bilibili_url}": t.id for t in tasks}
-    selected_label = st.selectbox("选择任务查看详情", list(options.keys()))
-    selected_id = options[selected_label]
+    options = {t.id: f"#{t.id} | {STATUS_MAP.get(t.status, t.status)} | {t.video_title or '未命名'}" for t in tasks}
+    selected_id = st.selectbox(
+        "选择任务查看详情",
+        options=list(options.keys()),
+        format_func=lambda tid: options.get(tid, str(tid)),
+    )
     task = get_task(selected_id)
     if not task:
         st.warning("任务不存在")
         return
+
+    if not task.video_title:
+        if st.button("重新获取标题", use_container_width=True, type="secondary"):
+            _refresh_title(task.id, task.bilibili_url)
 
     left, right = st.columns(2)
     with left:
@@ -172,6 +181,13 @@ def _render_history() -> None:
         f"时长：{_format_duration(task.video_duration_seconds)}, "
         f"创建时间：{task.created_at}"
     )
+
+    if not task.video_title:
+        if st.button("重新获取标题", use_container_width=True, type="secondary"):
+            _refresh_title(task.id, task.bilibili_url)
+    if task.status in {TaskStatus.SUMMARIZING.value, TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}:
+        if st.button("重新生成总结", use_container_width=True, type="primary"):
+            _regenerate_summary(task)
 
 
 def _render_settings() -> None:
@@ -235,6 +251,41 @@ def _format_duration(seconds: Optional[int]) -> str:
     if h:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def _refresh_title(task_id: int, url: str) -> None:
+    """使用 yt-dlp metadata 重新获取标题并更新任务、下拉显示。"""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": False,
+    }
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        title = info.get("title") if isinstance(info, dict) else None
+        duration = int(info.get("duration")) if isinstance(info, dict) and info.get("duration") else None
+        update_task_content(task_id, video_title=title, video_duration_seconds=duration)
+        st.success("标题已刷新")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"获取标题失败：{exc}")
+
+
+def _regenerate_summary(task: Task) -> None:
+    """使用已存转录重新生成总结。"""
+    if not task.transcript_text:
+        st.error("暂无转录文本，无法生成总结")
+        return
+    try:
+        update_task_status(task.id, TaskStatus.SUMMARIZING.value)
+        summary = generate_summary(task.transcript_text, system_prompt=_get_active_prompt())
+        update_task_content(task.id, summary_text=summary)
+        update_task_status(task.id, TaskStatus.COMPLETED.value)
+        st.success("总结已重新生成")
+    except Exception as exc:  # noqa: BLE001
+        update_task_status(task.id, TaskStatus.FAILED.value)
+        st.error(f"重新生成失败：{exc}")
 
 
 def _render_copy_address() -> None:
