@@ -27,6 +27,10 @@ data/                 # SQLite 存放目录（已忽略）
 downloads/            # 音频缓存目录（已忽略）
 ```
 
+### 架构与流程图
+- 查看详细架构说明： [docs/architecture.md](docs/architecture.md)
+- 默认总结 Prompt： [docs/default_prompt.md](docs/default_prompt.md)
+
 ### 快速开始
 1) 安装依赖（已包含 yt-dlp / whisper / streamlit 等）  
    ```bash
@@ -88,4 +92,3 @@ downloads/            # 音频缓存目录（已忽略）
 
 ### 架构与流程图
 - 查看详细架构说明： [docs/architecture.md](docs/architecture.md)
-
