@@ -305,6 +305,24 @@ def _render_copy_address() -> None:
     st.code(selected, language="text")
     st.caption("提示：手机需与本机同一局域网；如无法访问，请检查防火墙/端口。")
 
+    badge = f"""
+    <div style="
+        position: fixed;
+        top: 10px;
+        right: 12px;
+        z-index: 9999;
+        background: #0f172a;
+        color: #e2e8f0;
+        padding: 6px 10px;
+        border-radius: 8px;
+        font-size: 12px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+    ">
+      LAN: <a href="{selected}" target="_blank" style="color:#38bdf8; text-decoration:none;">{selected}</a>
+    </div>
+    """
+    st.markdown(badge, unsafe_allow_html=True)
+
 
 def _copy_to_clipboard(text: str) -> None:
     # Streamlit 无法直接写客户端剪贴板，这里将内容放入 session_state，便于前端自定义 JS 读取。
