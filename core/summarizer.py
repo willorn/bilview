@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -66,11 +67,13 @@ def generate_summary(
     Raises:
         RuntimeError: 当请求失败或响应格式异常时抛出。
     """
+    sanitized_text = _sanitize_text(text)
+
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt or _DEFAULT_SYSTEM_PROMPT},
-            {"role": "user", "content": text},
+            {"role": "user", "content": sanitized_text},
         ],
         "temperature": temperature,
     }
@@ -127,4 +130,22 @@ def _respect_rate_limit() -> None:
 def _get_env_key() -> Optional[str]:
     """读取环境变量中的密钥，未设置则返回 None。"""
     return os.getenv("X666_API_KEY") or X666_API_KEY
+
+
+def _sanitize_text(text: str, max_url_len: int = 120) -> str:
+    """
+    对输入文本进行简单清洗：截断过长 URL，避免上游因异常参数报错。
+
+    Args:
+        text: 原始转录文本。
+        max_url_len: URL 允许的最大长度，超出将被截断并追加占位提示。
+    """
+
+    def _truncate(match: re.Match[str]) -> str:
+        url = match.group(0)
+        if len(url) <= max_url_len:
+            return url
+        return url[:max_url_len] + "...[truncated]"
+
+    return re.sub(r"https?://\\S+", _truncate, text)
 import os
