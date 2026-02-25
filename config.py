@@ -10,15 +10,25 @@ from typing import Optional
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DOWNLOAD_DIR = BASE_DIR / "downloads"
+
+# 读取 .env（若不存在不报错）
+load_dotenv(BASE_DIR / ".env")
+
+# 优先使用 /data（HF Spaces 持久卷）或环境变量 BILVIEW_STORAGE_DIR，自适应本地/云端
+DEFAULT_STORAGE_ROOT = Path("/data") if Path("/data").exists() else BASE_DIR
+STORAGE_ROOT = Path(
+    os.getenv("BILVIEW_STORAGE_DIR", DEFAULT_STORAGE_ROOT)
+).expanduser().resolve()
+DATA_DIR = STORAGE_ROOT / "data"
+DOWNLOAD_DIR = STORAGE_ROOT / "downloads"
 DB_PATH = DATA_DIR / "app.db"
 
 DEFAULT_LLM_API_URL = "https://x666.me/v1/chat/completions"
 DEFAULT_LLM_MODEL = "gemini-2.5-pro-1m"
 
-# 读取 .env（若不存在不报错）
-load_dotenv(BASE_DIR / ".env")
+# 确保数据与下载目录存在（兼容 /data 持久卷）
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_api_key(env_name: str, default: Optional[str] = None) -> Optional[str]:

@@ -14,10 +14,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
+from config import DB_PATH
+
 CONNECTION_TIMEOUT_SECONDS = 30
 DATA_DIR_NAME = "data"
 DB_FILE_NAME = "app.db"
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / DATA_DIR_NAME / DB_FILE_NAME
+DEFAULT_DB_PATH = DB_PATH
 
 
 class TaskStatus(str, Enum):

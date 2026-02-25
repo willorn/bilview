@@ -5,7 +5,7 @@
 ### 主要特性
 - **全本地转写**：内置 Whisper（默认 tiny，可切换 base/small…），避免在线 ASR 成本。
 - **一键流程**：Streamlit 界面触发，自动串联下载 / 转写 / 总结并写入 SQLite。
-- **结果持久化**：`data/app.db` 自动建表，历史记录可浏览与下载。
+- **结果持久化**：默认写入 `/data/data/app.db`（如存在 HF /data 持久卷），否则使用仓库内 `data/app.db`，并可用环境变量 `BILVIEW_STORAGE_DIR` 自定义。
 - **可配置 LLM**：默认 `gemini-2.5-pro-1m`（x666 接口），支持自定义模型、温度、API Key。
 - **安全实践**：状态存储英文枚举，UI 层中文映射；SQL 全部使用占位符。
 - **元信息存储**：任务表包含视频标题与时长（秒），便于后续统计与展示。
@@ -23,13 +23,15 @@ db/
 utils/
   file_helper.py      # 目录与文件工具
   network.py          # 局域网地址获取
-data/                 # SQLite 存放目录（已忽略）
-downloads/            # 音频缓存目录（已忽略）
+data/                 # 存储根下的数据目录（/data/data 或本地 ./data，已忽略）
+downloads/            # 存储根下的音频缓存目录（已忽略）
 ```
 
 ### 架构与流程图
 - 查看详细架构说明： [docs/architecture.md](docs/architecture.md)
 - 默认总结 Prompt： [docs/default_prompt.md](docs/default_prompt.md)
+
+
 
 ### 快速开始
 1) 安装依赖（已包含 yt-dlp / whisper / streamlit 等）  
@@ -43,6 +45,7 @@ downloads/            # 音频缓存目录（已忽略）
    ```
    X666_API_KEY=你的key
    ```
+
 
 3) 启动前端  
    ```bash
@@ -63,9 +66,15 @@ downloads/            # 音频缓存目录（已忽略）
 - Streamlit 对窄屏会自动折叠为单列布局；下载按钮在手机上可直接保存文件。
 
 ### 配置要点
+- Python 版本建议 3.10/3.12；若平台固定为 3.13，请确保 `audioop-lts` 已安装（requirements 已按条件依赖声明），或通过 `runtime.txt` 指定 3.12。
 - `.env`：`X666_API_KEY`（优先）  
 - `config.py`：`DEFAULT_LLM_API_URL`、`DEFAULT_LLM_MODEL`、`DB_PATH`、`DOWNLOAD_DIR` 等集中管理。  
 - 状态枚举：DB 中存英文 (`waiting/downloading/...`)，UI 层通过 `STATUS_MAP` 映射中文。
+
+### 存储路径与部署
+- 默认存储根：检测到 `/data` 则使用（如 HF Spaces 持久卷），否则回退仓库根目录；可通过环境变量 `BILVIEW_STORAGE_DIR` 覆盖。
+- SQLite 与下载文件分别位于 `data/` 与 `downloads/` 子目录，首次运行自动创建。
+- 部署到云端时建议把持久卷挂载到 `/data` 或设置 `BILVIEW_STORAGE_DIR`，避免重启丢任务与音频。
 
 ### 开发与测试
 - 语法检查：`python -m py_compile app.py core/*.py db/*.py`  
@@ -84,11 +93,9 @@ downloads/            # 音频缓存目录（已忽略）
   PY
   ```
 
+
 ### 注意事项
 - `data/` 与 `downloads/` 已忽略，请勿提交运行期数据或音频文件。  
 - 如需 GPU/MPS 加速，安装对应的 `torch` 版本；代码会自动选择可用设备并在不支持时回退 CPU。  
 - 若需更高精度，可将 `model_size` 调为 `small/base/medium`，性能与显存占用相应上升。  
 - 若需更复杂的限流/重试策略，可在 `core/summarizer.py` 扩展。 
-
-### 架构与流程图
-- 查看详细架构说明： [docs/architecture.md](docs/architecture.md)
