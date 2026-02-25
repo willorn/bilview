@@ -20,6 +20,14 @@ from pydub import AudioSegment
 import torch
 import whisper
 
+# 规避 Streamlit 文件监控在检查 torch.classes.__path__ 时触发的 RuntimeError
+# 参考：https://discuss.streamlit.io/t/error-in-torch-with-streamlit/90908
+try:
+    torch.classes.__path__ = []  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    # 若未来 PyTorch 调整实现，确保应用不因兜底处理失败而中断
+    pass
+
 DEFAULT_MODEL_SIZE = "base"
 CHUNK_DURATION_SECONDS = 300  # 每段 5 分钟，兼顾稳定性与性能
 FILE_SIZE_LIMIT_MB = 25
