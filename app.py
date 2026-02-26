@@ -36,6 +36,7 @@ from db.database import (
     update_task_status,
     update_transcription_progress,
 )
+from utils.copy_button import create_task_copy_button
 from utils.file_helper import ensure_dir
 
 STATUS_MAP = {
@@ -221,7 +222,9 @@ def _render_history() -> None:
                 file_name=f"task_{task.id}_transcript.txt",
                 mime="text/plain",
             )
-            st.button("复制逐字稿", on_click=_copy_to_clipboard, args=(task.transcript_text,), use_container_width=True, key=f"copy_transcript_{task.id}")
+            # 使用工具函数生成复制按钮
+            copy_button_html = create_task_copy_button(task.id, task.transcript_text)
+            st.markdown(copy_button_html, unsafe_allow_html=True)
     with right:
         st.markdown("**总结结果**")
         st.text_area("summary", value=task.summary_text or "", height=400, label_visibility="collapsed")
@@ -457,11 +460,6 @@ def _render_copy_address() -> None:
     </div>
     """
     st.markdown(badge, unsafe_allow_html=True)
-
-
-def _copy_to_clipboard(text: str) -> None:
-    # Streamlit 无法直接写客户端剪贴板，这里将内容放入 session_state，便于前端自定义 JS 读取。
-    st.session_state["clipboard_text"] = text
 
 
 _DEFAULT_PROMPT = """你是一个专业的长视频笔记助手，请将输入的完整转录文本，提炼为结构化笔记，需包含：
