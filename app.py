@@ -15,6 +15,7 @@ import streamlit as st
 from yt_dlp import YoutubeDL
 
 from utils.network import get_lan_addresses
+from utils.url_helper import process_user_input
 from config import DOWNLOAD_DIR, ensure_api_key_present
 from core.downloader import download_audio
 from core.summarizer import generate_summary
@@ -64,20 +65,25 @@ def main() -> None:
 
     col_input, col_action = st.columns([4, 1], vertical_alignment="bottom")
     with col_input:
-        url = st.text_input(
+        user_input = st.text_input(
             "B 站视频链接",
-            placeholder="https://b23.tv/xxxx 或 https://www.bilibili.com/video/BV...",
+            placeholder="支持：https://b23.tv/xxxx 或【标题】https://b23.tv/xxxx",
         )
     with col_action:
         run_btn = st.button(
             "开始处理",
             type="primary",
             use_container_width=True,
-            disabled=not url or st.session_state.running_task_id is not None,
+            disabled=not user_input or st.session_state.running_task_id is not None,
         )
 
-    if run_btn and url:
-        st.session_state.running_task_id = _start_task(url)
+    if run_btn and user_input:
+        # 提取并清洗 URL
+        url = process_user_input(user_input)
+        if not url:
+            st.error("无法识别有效的 B 站链接，请检查输入格式")
+        else:
+            st.session_state.running_task_id = _start_task(url)
 
     if st.session_state.running_task_id is not None:
         _render_running_task(st.session_state.running_task_id)
