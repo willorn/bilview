@@ -5,19 +5,24 @@
 1. 仅下载最佳音质的音频流（默认提取为 M4A）。
 2. 自动创建 downloads 目录并生成规范文件名。
 3. 预留 cookie 文件支持，处理需要登录态的会员视频。
+4. 自动重试机制：区分网络临时性错误和永久性错误，使用指数退避策略。
 
 @author 开发
 @date 2026-02-23
-@version v1.0
+@version v1.1 (新增重试机制)
 """
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 from yt_dlp import YoutubeDL
 from utils.file_helper import ensure_dir
+from utils.retry_helper import download_retry_decorator
+
+logger = logging.getLogger(__name__)
 
 DOWNLOAD_DIR_NAME = "downloads"
 PREFERRED_CODEC = "m4a"
@@ -28,6 +33,7 @@ DEFAULT_COOKIE_FILE = Path("cookie.txt")
 INVALID_FILENAME_CHARS = r'[^a-zA-Z0-9\\-_\\.]'
 
 
+@download_retry_decorator
 def download_audio(
     url: str,
     download_dir: Path | str = DEFAULT_DOWNLOAD_DIR,
@@ -36,6 +42,12 @@ def download_audio(
 ) -> Union[Path, Tuple[Path, dict]]:
     """
     下载指定 B 站链接的音频流并返回本地文件路径。
+
+    自动重试策略：
+    - 最大重试 3 次
+    - 指数退避：2-30 秒
+    - 可重试错误：网络超时、连接失败、临时不可用
+    - 不可重试错误：视频不存在、权限问题、地区限制
 
     Args:
         url: B 站视频链接。
@@ -59,8 +71,10 @@ def download_audio(
             # yt-dlp 会在后处理阶段将扩展名替换为首选编解码格式
             raw_path = Path(ydl.prepare_filename(info))
             final_path = raw_path.with_suffix(f".{PREFERRED_CODEC}")
+            logger.info(f"音频下载成功: {final_path}")
             return (final_path, info) if return_info else final_path
     except Exception as exc:  # noqa: BLE001
+        logger.warning(f"音频下载失败: {exc}")
         raise RuntimeError(f"音频下载失败：{exc}") from exc
 
 

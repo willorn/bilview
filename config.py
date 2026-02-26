@@ -26,6 +26,13 @@ DB_PATH = DATA_DIR / "app.db"
 DEFAULT_LLM_API_URL = "https://x666.me/v1/chat/completions"
 DEFAULT_LLM_MODEL = "gemini-2.5-pro-1m"
 
+# 重试配置
+RETRY_MAX_ATTEMPTS_DOWNLOAD = 3  # 下载最大重试次数
+RETRY_MAX_ATTEMPTS_API = 4  # API 调用最大重试次数
+RETRY_WAIT_MIN = 1  # 最小等待时间（秒）
+RETRY_WAIT_MAX_DOWNLOAD = 30  # 下载最大等待时间（秒）
+RETRY_WAIT_MAX_API = 20  # API 最大等待时间（秒）
+
 # 确保数据与下载目录存在（兼容 /data 持久卷）
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)

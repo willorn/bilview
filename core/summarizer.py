@@ -5,14 +5,16 @@
 1. 采用同步 HTTP 请求，默认 20 秒速率限制（简单全局限流）。
 2. 支持自定义 System Prompt、温度、模型名与超时。
 3. 支持从环境变量 `X666_API_KEY` 读取密钥，若缺省则使用文档提供的默认 key。
+4. 自动重试机制：区分可重试错误（429/5xx/网络）和不可重试错误（4xx），使用指数退避策略。
 
 @author 开发
 @date 2026-02-23
-@version v1.0
+@version v1.1 (新增重试机制)
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -21,6 +23,9 @@ import urllib.request
 from typing import Optional
 
 from config import DEFAULT_LLM_API_URL, DEFAULT_LLM_MODEL, X666_API_KEY
+from utils.retry_helper import api_retry_decorator
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = DEFAULT_LLM_API_URL
 DEFAULT_MODEL = DEFAULT_LLM_MODEL
@@ -84,8 +89,17 @@ def generate_summary(
     return _call_api(payload, chosen_key, timeout, api_url)
 
 
+@api_retry_decorator
 def _call_api(payload: dict, api_key: str, timeout: int, api_url: str) -> str:
-    """执行 HTTP 请求并解析响应。"""
+    """
+    执行 HTTP 请求并解析响应。
+
+    自动重试策略：
+    - 最大重试 4 次
+    - 指数退避：1-20 秒
+    - 可重试错误：429、5xx、网络超时
+    - 不可重试错误：4xx（除 429）
+    """
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -103,10 +117,13 @@ def _call_api(payload: dict, api_key: str, timeout: int, api_url: str) -> str:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        logger.warning(f"HTTP {exc.code} 错误: {detail}")
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
+        logger.warning(f"网络请求失败: {exc}")
         raise RuntimeError(f"Request failed: {exc}") from exc
     except Exception as exc:  # noqa: BLE001
+        logger.warning(f"请求异常: {exc}")
         raise RuntimeError(f"Request error: {exc}") from exc
 
     try:
