@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydub import AudioSegment
 import torch
@@ -41,6 +41,8 @@ def audio_to_text(
     chunk_duration_sec: int = CHUNK_DURATION_SECONDS,
     file_size_limit_mb: int = FILE_SIZE_LIMIT_MB,
     device: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int, str, float, float], None]] = None,
+    resume_from_chunks: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     将音频文件转录为文本（离线 Whisper）。
@@ -52,6 +54,8 @@ def audio_to_text(
         chunk_duration_sec: 切片时长阈值（秒），超过则分片转录。
         file_size_limit_mb: 文件大小阈值（MB），超过则分片转录。
         device: 推理设备（'cuda'/'mps'/'cpu'），None 时自动选择。
+        progress_callback: 进度回调函数，签名为 (current, total, chunk_text, start_sec, end_sec)。
+        resume_from_chunks: 断点续传数据，包含已完成切片的信息。
 
     Returns:
         逐字稿文本（去除首尾空白）。
@@ -76,17 +80,40 @@ def audio_to_text(
 
         if not needs_chunk:
             result = model.transcribe(str(path), language=language, fp16=False)
-            return result.get("text", "").strip()
+            text = result.get("text", "").strip()
+            # 即使不分片，也触发回调（作为单个完整切片）
+            if progress_callback:
+                progress_callback(1, 1, text, 0, audio.duration_seconds)
+            return text
 
         segments = _split_audio(audio, chunk_duration_sec)
+        total_chunks = len(segments)
         texts: List[str] = []
 
-        for segment in segments:
+        # 断点续传：跳过已完成切片
+        start_index = 0
+        if resume_from_chunks:
+            completed_chunks = [c for c in resume_from_chunks if c.get("completed")]
+            completed_texts = [c["text"] for c in completed_chunks if c.get("text")]
+            texts.extend(completed_texts)
+            start_index = len(completed_chunks)
+
+        for i in range(start_index, total_chunks):
+            segment = segments[i]
+            start_sec = i * chunk_duration_sec
+            end_sec = min((i + 1) * chunk_duration_sec, audio.duration_seconds)
+
             with NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
                 segment.export(tmp_file.name, format="wav")
                 result = model.transcribe(tmp_file.name, language=language, fp16=False)
             Path(tmp_file.name).unlink(missing_ok=True)
-            texts.append(result.get("text", "").strip())
+
+            chunk_text = result.get("text", "").strip()
+            texts.append(chunk_text)
+
+            # 触发进度回调
+            if progress_callback:
+                progress_callback(i + 1, total_chunks, chunk_text, start_sec, end_sec)
 
         return " ".join(filter(None, texts)).strip()
     except Exception as exc:  # noqa: BLE001

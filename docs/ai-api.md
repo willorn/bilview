@@ -9,13 +9,6 @@ https://x666.me
 ```
 
 
-
-
-
-
-
-
-
 ```bash
 #!/usr/bin/env python3
 """

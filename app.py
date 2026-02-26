@@ -24,14 +24,17 @@ from db.database import (
     DEFAULT_DB_PATH,
     Task,
     TaskStatus,
+    assemble_partial_transcript,
     create_task,
     delete_tasks_before,
     delete_tasks_by_status,
     get_task,
+    get_transcription_progress,
     init_db,
     list_tasks,
     update_task_content,
     update_task_status,
+    update_transcription_progress,
 )
 from utils.file_helper import ensure_dir
 
@@ -119,8 +122,45 @@ def _process_task(task_id: int, url: str) -> None:
             )
 
             update_task_status(task_id, TaskStatus.TRANSCRIBING.value)
-            status_box.write("转写中（Whisper）...")
-            transcript = audio_to_text(audio_path, model_size="tiny", language="zh")
+
+            # 检查是否有断点续传数据
+            existing_progress = get_transcription_progress(task_id)
+            resume_chunks = None
+            if existing_progress and existing_progress.get("completed_chunks", 0) > 0:
+                resume_chunks = existing_progress["chunks"]
+                status_box.info(f"从第 {existing_progress['completed_chunks'] + 1} 个切片继续...")
+
+            # 创建进度条容器
+            progress_container = status_box.container()
+            progress_bar = progress_container.progress(0, text="准备转写...")
+
+            # 定义进度回调函数
+            def on_chunk_completed(current: int, total: int, chunk_text: str, start_sec: float, end_sec: float) -> None:
+                # 保存到数据库
+                update_transcription_progress(
+                    task_id=task_id,
+                    chunk_index=current - 1,
+                    total_chunks=total,
+                    chunk_text=chunk_text,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                )
+
+                # 更新进度条
+                progress_percent = current / total
+                progress_bar.progress(
+                    progress_percent,
+                    text=f"转写进度：{current}/{total} 切片 ({int(progress_percent * 100)}%)"
+                )
+
+            # 调用转写（带回调和断点续传）
+            transcript = audio_to_text(
+                audio_path,
+                model_size="tiny",
+                language="zh",
+                progress_callback=on_chunk_completed,
+                resume_from_chunks=resume_chunks,
+            )
             update_task_content(task_id, transcript_text=transcript)
 
             update_task_status(task_id, TaskStatus.SUMMARIZING.value)
@@ -131,6 +171,12 @@ def _process_task(task_id: int, url: str) -> None:
             update_task_status(task_id, TaskStatus.COMPLETED.value)
             status_box.update(label="处理完成", state="complete")
         except Exception as exc:  # noqa: BLE001
+            # 保存部分结果
+            partial_transcript = assemble_partial_transcript(task_id)
+            if partial_transcript:
+                update_task_content(task_id, transcript_text=partial_transcript)
+                status_box.warning(f"转写部分完成（{len(partial_transcript)} 字符），但遇到错误")
+
             update_task_status(task_id, TaskStatus.FAILED.value)
             status_box.update(label="处理失败", state="error")
             status_box.write(f"错误：{exc}")
@@ -192,6 +238,16 @@ def _render_history() -> None:
         f"时长：{_format_duration(task.video_duration_seconds)}, "
         f"创建时间：{task.created_at}"
     )
+
+    # 显示转写进度信息
+    if task.status == TaskStatus.FAILED.value:
+        progress = get_transcription_progress(task.id)
+        if progress and progress.get("completed_chunks", 0) > 0:
+            st.info(
+                f"转写进度：已完成 {progress['completed_chunks']}/{progress['total_chunks']} 个切片"
+            )
+            if st.button("从断点继续转写", use_container_width=True, type="primary", key=f"retry_{task.id}"):
+                _retry_transcription(task)
 
     if not task.video_title:
         if st.button("重新获取标题", use_container_width=True, type="secondary"):
@@ -297,6 +353,79 @@ def _regenerate_summary(task: Task) -> None:
     except Exception as exc:  # noqa: BLE001
         update_task_status(task.id, TaskStatus.FAILED.value)
         st.error(f"重新生成失败：{exc}")
+
+
+def _retry_transcription(task: Task) -> None:
+    """从断点继续转写失败的任务。"""
+    if not task.audio_file_path:
+        st.error("音频文件路径缺失，无法继续转写")
+        return
+
+    audio_path = Path(task.audio_file_path)
+    if not audio_path.exists():
+        st.error(f"音频文件不存在：{audio_path}")
+        return
+
+    with st.status("继续转写中...", expanded=True) as status_box:
+        try:
+            update_task_status(task.id, TaskStatus.TRANSCRIBING.value)
+
+            # 获取断点续传数据
+            existing_progress = get_transcription_progress(task.id)
+            resume_chunks = None
+            if existing_progress:
+                resume_chunks = existing_progress["chunks"]
+                status_box.info(f"从第 {existing_progress['completed_chunks'] + 1} 个切片继续...")
+
+            # 创建进度条
+            progress_container = status_box.container()
+            progress_bar = progress_container.progress(0, text="准备转写...")
+
+            # 定义进度回调
+            def on_chunk_completed(current: int, total: int, chunk_text: str, start_sec: float, end_sec: float) -> None:
+                update_transcription_progress(
+                    task_id=task.id,
+                    chunk_index=current - 1,
+                    total_chunks=total,
+                    chunk_text=chunk_text,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                )
+                progress_percent = current / total
+                progress_bar.progress(
+                    progress_percent,
+                    text=f"转写进度：{current}/{total} 切片 ({int(progress_percent * 100)}%)"
+                )
+
+            # 调用转写
+            transcript = audio_to_text(
+                audio_path,
+                model_size="tiny",
+                language="zh",
+                progress_callback=on_chunk_completed,
+                resume_from_chunks=resume_chunks,
+            )
+            update_task_content(task.id, transcript_text=transcript)
+
+            # 继续总结
+            update_task_status(task.id, TaskStatus.SUMMARIZING.value)
+            status_box.write("总结中（LLM）...")
+            summary = generate_summary(transcript, system_prompt=_get_active_prompt())
+            update_task_content(task.id, summary_text=summary)
+
+            update_task_status(task.id, TaskStatus.COMPLETED.value)
+            status_box.update(label="处理完成", state="complete")
+            st.success("转写已完成")
+        except Exception as exc:  # noqa: BLE001
+            # 保存部分结果
+            partial_transcript = assemble_partial_transcript(task.id)
+            if partial_transcript:
+                update_task_content(task.id, transcript_text=partial_transcript)
+                status_box.warning(f"转写部分完成（{len(partial_transcript)} 字符），但遇到错误")
+
+            update_task_status(task.id, TaskStatus.FAILED.value)
+            status_box.update(label="处理失败", state="error")
+            status_box.write(f"错误：{exc}")
 
 
 def _render_copy_address() -> None:

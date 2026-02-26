@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -382,3 +383,147 @@ def _ensure_extra_columns(connection: sqlite3.Connection) -> None:
     existing = {row["name"] for row in cursor.fetchall()}
     if "video_duration_seconds" not in existing:
         connection.execute("ALTER TABLE tasks ADD COLUMN video_duration_seconds INTEGER;")
+    _ensure_transcription_columns(connection)
+
+
+def _ensure_transcription_columns(connection: sqlite3.Connection) -> None:
+    """为转写进度功能添加必要字段（幂等操作）。"""
+    cursor = connection.execute("PRAGMA table_info(tasks);")
+    existing = {row["name"] for row in cursor.fetchall()}
+
+    if "transcription_progress" not in existing:
+        connection.execute("ALTER TABLE tasks ADD COLUMN transcription_progress TEXT;")
+    if "transcription_total_chunks" not in existing:
+        connection.execute("ALTER TABLE tasks ADD COLUMN transcription_total_chunks INTEGER;")
+    if "transcription_completed_chunks" not in existing:
+        connection.execute("ALTER TABLE tasks ADD COLUMN transcription_completed_chunks INTEGER;")
+
+    connection.commit()
+
+
+def update_transcription_progress(
+    task_id: int,
+    chunk_index: int,
+    total_chunks: int,
+    chunk_text: str,
+    start_sec: float,
+    end_sec: float,
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> None:
+    """
+    更新指定切片的转写进度。
+
+    Args:
+        task_id: 任务主键。
+        chunk_index: 切片索引（从 0 开始）。
+        total_chunks: 总切片数。
+        chunk_text: 切片转写文本。
+        start_sec: 切片起始时间（秒）。
+        end_sec: 切片结束时间（秒）。
+        db_path: 数据库文件路径。
+    """
+    with get_connection(db_path) as connection:
+        # 读取现有进度
+        cursor = connection.execute(
+            "SELECT transcription_progress FROM tasks WHERE id = ?",
+            (task_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return
+
+        existing_json = row["transcription_progress"]
+        if existing_json:
+            progress = json.loads(existing_json)
+        else:
+            # 初始化进度结构
+            progress = {
+                "total_chunks": total_chunks,
+                "completed_chunks": 0,
+                "chunks": [
+                    {
+                        "index": i,
+                        "start_sec": 0,
+                        "end_sec": 0,
+                        "text": None,
+                        "completed": False
+                    }
+                    for i in range(total_chunks)
+                ]
+            }
+
+        # 更新指定切片
+        if chunk_index < len(progress["chunks"]):
+            progress["chunks"][chunk_index] = {
+                "index": chunk_index,
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "text": chunk_text,
+                "completed": True
+            }
+
+        # 重新计算已完成数量
+        completed_count = sum(1 for c in progress["chunks"] if c["completed"])
+        progress["completed_chunks"] = completed_count
+
+        # 写回数据库
+        connection.execute(
+            """
+            UPDATE tasks
+            SET transcription_progress = ?,
+                transcription_total_chunks = ?,
+                transcription_completed_chunks = ?
+            WHERE id = ?
+            """,
+            (json.dumps(progress, ensure_ascii=False), total_chunks, completed_count, task_id)
+        )
+        connection.commit()
+
+
+def get_transcription_progress(
+    task_id: int, db_path: Path | str = DEFAULT_DB_PATH
+) -> Optional[Dict[str, Any]]:
+    """
+    获取任务的转写进度信息。
+
+    Args:
+        task_id: 任务主键。
+        db_path: 数据库文件路径。
+
+    Returns:
+        进度 JSON 字典，未找到或无进度时返回 None。
+    """
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            "SELECT transcription_progress FROM tasks WHERE id = ?",
+            (task_id,)
+        )
+        row = cursor.fetchone()
+        if not row or not row["transcription_progress"]:
+            return None
+        return json.loads(row["transcription_progress"])
+
+
+def assemble_partial_transcript(
+    task_id: int, db_path: Path | str = DEFAULT_DB_PATH
+) -> str:
+    """
+    从进度 JSON 中拼接已完成切片的文本（用于失败时保存部分结果）。
+
+    Args:
+        task_id: 任务主键。
+        db_path: 数据库文件路径。
+
+    Returns:
+        已完成切片的拼接文本。
+    """
+    progress = get_transcription_progress(task_id, db_path)
+    if not progress:
+        return ""
+
+    completed_texts = [
+        chunk["text"]
+        for chunk in progress.get("chunks", [])
+        if chunk.get("completed") and chunk.get("text")
+    ]
+    return " ".join(completed_texts).strip()
