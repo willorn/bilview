@@ -37,6 +37,7 @@ from db.database import (
     update_transcription_progress,
 )
 from utils.copy_button import create_task_copy_button
+from utils.download_button import create_download_button
 from utils.file_helper import ensure_dir
 
 STATUS_MAP = {
@@ -47,6 +48,12 @@ STATUS_MAP = {
     TaskStatus.COMPLETED.value: "已完成",
     TaskStatus.FAILED.value: "失败",
 }
+
+SUMMARY_MODEL_OPTIONS = [
+    ("默认（config.py）", DEFAULT_LLM_MODEL),
+    ("gpt-5.2-high", "gpt-5.2-high"),
+    ("gemini-3-flash-preview", "gemini-3-flash-preview"),
+]
 
 
 def main() -> None:
@@ -216,12 +223,14 @@ def _render_history() -> None:
         st.markdown("**转录文本**")
         st.text_area("transcript", value=task.transcript_text or "", height=400, label_visibility="collapsed")
         if task.transcript_text:
-            st.download_button(
-                "下载逐字稿 (.txt)",
-                data=(task.transcript_text or "").encode("utf-8"),
-                file_name=f"task_{task.id}_transcript.txt",
+            transcript_download = create_download_button(
+                button_id=f"transcript_{task.id}",
+                content=task.transcript_text,
+                filename=f"task_{task.id}_transcript.txt",
+                label="下载逐字稿 (.txt)",
                 mime="text/plain",
             )
+            st.markdown(transcript_download, unsafe_allow_html=True)
             # 使用工具函数生成复制按钮
             copy_button_html = create_task_copy_button(task.id, task.transcript_text)
             st.markdown(copy_button_html, unsafe_allow_html=True)
@@ -229,12 +238,14 @@ def _render_history() -> None:
         st.markdown("**总结结果**")
         st.text_area("summary", value=task.summary_text or "", height=400, label_visibility="collapsed")
         if task.summary_text:
-            st.download_button(
-                "下载总结 (.md)",
-                data=(task.summary_text or "").encode("utf-8"),
-                file_name=f"task_{task.id}_summary.md",
+            summary_download = create_download_button(
+                button_id=f"summary_{task.id}",
+                content=task.summary_text,
+                filename=f"task_{task.id}_summary.md",
+                label="下载总结 (.md)",
                 mime="text/markdown",
             )
+            st.markdown(summary_download, unsafe_allow_html=True)
 
     st.caption(
         f"任务状态：{STATUS_MAP.get(task.status, task.status)}，"
@@ -252,12 +263,14 @@ def _render_history() -> None:
             if st.button("从断点继续转写", use_container_width=True, type="primary", key=f"retry_{task.id}"):
                 _retry_transcription(task)
 
-    if not task.video_title:
-        if st.button("重新获取标题", use_container_width=True, type="secondary"):
-            _refresh_title(task.id, task.bilibili_url)
     if task.status in {TaskStatus.SUMMARIZING.value, TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}:
-        if st.button("重新生成总结", use_container_width=True, type="primary"):
-            _regenerate_summary(task)
+        if st.button("重新生成总结", use_container_width=True, type="primary", key=f"regen_{task.id}"):
+            st.session_state["show_regen_dialog"] = True
+            st.session_state["regen_task_id"] = task.id
+            st.session_state.setdefault("regen_model_choice", SUMMARY_MODEL_OPTIONS[0][1])
+
+    if st.session_state.get("show_regen_dialog") and st.session_state.get("regen_task_id") == task.id:
+        _render_regen_dialog(task)
 
 
 def _render_settings() -> None:
@@ -293,6 +306,40 @@ def _render_settings() -> None:
                 removed_files = _cleanup_files()
             st.success(f"清理完成：删除记录 {removed_rows} 条，删除音频文件 {removed_files} 个。")
         st.caption("提示：days=0 表示不按时间删除；状态未选则跳过状态清理。")
+
+
+def _render_regen_dialog(task: Task) -> None:
+    """弹窗选择模型后重新生成总结。"""
+    model_values = [item[1] for item in SUMMARY_MODEL_OPTIONS]
+    label_map = {val: label for label, val in SUMMARY_MODEL_OPTIONS}
+    current = st.session_state.get("regen_model_choice", model_values[0])
+    try:
+        default_index = model_values.index(current)
+    except ValueError:
+        default_index = 0
+
+    @st.dialog("选择总结模型")
+    def _dialog() -> None:
+        selected_model = st.radio(
+            "选择模型",
+            options=model_values,
+            index=default_index,
+            format_func=lambda val: f"{label_map.get(val, val)}",
+            key=f"regen_model_radio_{task.id}",
+        )
+        st.session_state["regen_model_choice"] = selected_model
+        st.caption("提示：当前模型高峰期可切换备用模型再试。")
+
+        col_confirm, col_cancel = st.columns(2)
+        with col_confirm:
+            if st.button("开始生成", type="primary", use_container_width=True, key=f"confirm_regen_{task.id}"):
+                _regenerate_summary(task, model=selected_model)
+        with col_cancel:
+            if st.button("取消", use_container_width=True, key=f"cancel_regen_{task.id}"):
+                st.session_state["show_regen_dialog"] = False
+                st.session_state["regen_task_id"] = None
+
+    _dialog()
 
 
 def _cleanup_files() -> int:
@@ -342,20 +389,28 @@ def _refresh_title(task_id: int, url: str) -> None:
         st.error(f"获取标题失败：{exc}")
 
 
-def _regenerate_summary(task: Task) -> None:
-    """使用已存转录重新生成总结。"""
+def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
+    """使用已存转录重新生成总结，可指定模型。"""
     if not task.transcript_text:
         st.error("暂无转录文本，无法生成总结")
         return
+    chosen_model = model or st.session_state.get("regen_model_choice") or DEFAULT_LLM_MODEL
     try:
         update_task_status(task.id, TaskStatus.SUMMARIZING.value)
-        summary = generate_summary(task.transcript_text, system_prompt=_get_active_prompt())
+        summary = generate_summary(
+            task.transcript_text,
+            system_prompt=_get_active_prompt(),
+            model=chosen_model,
+        )
         update_task_content(task.id, summary_text=summary)
         update_task_status(task.id, TaskStatus.COMPLETED.value)
         st.success("总结已重新生成")
     except Exception as exc:  # noqa: BLE001
         update_task_status(task.id, TaskStatus.FAILED.value)
         st.error(f"重新生成失败：{exc}")
+    finally:
+        st.session_state["show_regen_dialog"] = False
+        st.session_state["regen_task_id"] = None
 
 
 def _retry_transcription(task: Task) -> None:
