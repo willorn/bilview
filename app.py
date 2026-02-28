@@ -73,7 +73,7 @@ def main() -> None:
     if "running_task_id" not in st.session_state:
         st.session_state.running_task_id = None
 
-    st.title("Bilibili 视频转录与总结")
+    st.title("Bilibili Video Transcription and Summary")
     st.caption("输入 B 站链接，一键完成下载、转写、总结。")
 
     _render_copy_address()
@@ -584,29 +584,12 @@ def _render_copy_address() -> None:
         return
     port = st.session_state.get("server_port", 8501)
     options = [f"http://{addr}:{port}" for addr in addrs]
-    selected = options[0]
-    if len(options) > 1:
-        selected = st.selectbox("可用局域网地址", options, label_visibility="collapsed")
-    st.code(selected, language="text")
-    st.caption("提示：手机需与本机同一局域网；如无法访问，请检查防火墙/端口。")
-
-    badge = f"""
-    <div style="
-        position: fixed;
-        top: 10px;
-        right: 12px;
-        z-index: 9999;
-        background: #0f172a;
-        color: #e2e8f0;
-        padding: 6px 10px;
-        border-radius: 8px;
-        font-size: 12px;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.25);
-    ">
-      LAN: <a href="{selected}" target="_blank" style="color:#38bdf8; text-decoration:none;">{selected}</a>
-    </div>
-    """
-    st.markdown(badge, unsafe_allow_html=True)
+    with st.expander("局域网访问地址与提示", expanded=False):
+        selected = options[0]
+        if len(options) > 1:
+            selected = st.selectbox("可用局域网地址", options, label_visibility="collapsed")
+        st.code(selected, language="text")
+        st.caption("手机需与本机同一局域网；如无法访问，请检查防火墙/端口。")
 
 
 _DEFAULT_PROMPT = """你是一个专业的长视频笔记助手，请将输入的完整转录文本，提炼为结构化笔记，需包含：
