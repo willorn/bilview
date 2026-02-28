@@ -8,6 +8,7 @@ Streamlit 前端：负责输入、状态提示、历史记录与结果展示。
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -100,7 +101,7 @@ def main() -> None:
             if not url:
                 st.error("无法识别有效的 B 站链接，请检查输入格式")
             else:
-                st.session_state.running_task_id = _start_task(url)
+                st.session_state.running_task_id = _start_task(url, _get_active_prompt())
 
     if st.session_state.running_task_id is not None:
         _render_running_task(st.session_state.running_task_id)
@@ -114,92 +115,101 @@ def main() -> None:
         _render_history()
 
 
-def _start_task(url: str) -> int:
+def _start_task(url: str, system_prompt: Optional[str]) -> int:
     """创建任务并启动处理。"""
     task_id = create_task(bilibili_url=url, video_title="pending")
-    _process_task(task_id, url)
+    try:
+        worker = threading.Thread(
+            target=_process_task,
+            args=(task_id, url, system_prompt),
+            name=f"task-worker-{task_id}",
+            daemon=True,
+        )
+        worker.start()
+    except Exception as exc:  # noqa: BLE001
+        _mark_task_failed_safely(task_id, f"启动任务失败：{exc}")
+        st.error(f"任务启动失败：{exc}")
     return task_id
 
 
-def _process_task(task_id: int, url: str) -> None:
-    """顺序执行下载→转写→总结，异常自动标记失败。"""
-    with st.status("处理中...", expanded=True) as status_box:
+def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
+    """
+    后台顺序执行下载→转写→总结。
+
+    注意：这里不依赖 Streamlit UI 状态，避免浏览器断开导致任务中断。
+    """
+    try:
+        update_task_status(task_id, TaskStatus.DOWNLOADING.value)
+        audio_path, info = download_audio(url, download_dir=DOWNLOAD_DIR, return_info=True)
+        update_task_content(
+            task_id,
+            audio_file_path=str(audio_path),
+            video_title=info.get("title") if isinstance(info, dict) else None,
+            video_duration_seconds=int(info.get("duration")) if isinstance(info, dict) and info.get("duration") else None,
+        )
+
+        update_task_status(task_id, TaskStatus.TRANSCRIBING.value)
+
+        existing_progress = get_transcription_progress(task_id)
+        resume_chunks = None
+        if existing_progress and existing_progress.get("completed_chunks", 0) > 0:
+            resume_chunks = existing_progress["chunks"]
+
+        def on_chunk_completed(current: int, total: int, chunk_text: str, start_sec: float, end_sec: float) -> None:
+            update_transcription_progress(
+                task_id=task_id,
+                chunk_index=current - 1,
+                total_chunks=total,
+                chunk_text=chunk_text,
+                start_sec=start_sec,
+                end_sec=end_sec,
+            )
+
+        transcript = audio_to_text(
+            audio_path,
+            model_size="tiny",
+            language="zh",
+            progress_callback=on_chunk_completed,
+            resume_from_chunks=resume_chunks,
+        )
+        update_task_content(task_id, transcript_text=transcript)
+
+        update_task_status(task_id, TaskStatus.SUMMARIZING.value)
+        summary = generate_summary(transcript, system_prompt=system_prompt)
+        update_task_content(task_id, summary_text=summary)
+
+        update_task_status(task_id, TaskStatus.COMPLETED.value)
+    except Exception as exc:  # noqa: BLE001
         try:
-            update_task_status(task_id, TaskStatus.DOWNLOADING.value)
-            status_box.write("下载音频中...")
-            audio_path, info = download_audio(url, download_dir=DOWNLOAD_DIR, return_info=True)
-            update_task_content(
-                task_id,
-                audio_file_path=str(audio_path),
-                video_title=info.get("title") if isinstance(info, dict) else None,
-                video_duration_seconds=int(info.get("duration")) if isinstance(info, dict) and info.get("duration") else None,
-            )
-
-            update_task_status(task_id, TaskStatus.TRANSCRIBING.value)
-
-            # 检查是否有断点续传数据
-            existing_progress = get_transcription_progress(task_id)
-            resume_chunks = None
-            if existing_progress and existing_progress.get("completed_chunks", 0) > 0:
-                resume_chunks = existing_progress["chunks"]
-                status_box.info(f"从第 {existing_progress['completed_chunks'] + 1} 个切片继续...")
-
-            # 创建进度条容器
-            progress_container = status_box.container()
-            progress_bar = progress_container.progress(0, text="准备转写...")
-
-            # 定义进度回调函数
-            def on_chunk_completed(current: int, total: int, chunk_text: str, start_sec: float, end_sec: float) -> None:
-                # 保存到数据库
-                update_transcription_progress(
-                    task_id=task_id,
-                    chunk_index=current - 1,
-                    total_chunks=total,
-                    chunk_text=chunk_text,
-                    start_sec=start_sec,
-                    end_sec=end_sec,
-                )
-
-                # 更新进度条
-                progress_percent = current / total
-                progress_bar.progress(
-                    progress_percent,
-                    text=f"转写进度：{current}/{total} 切片 ({int(progress_percent * 100)}%)"
-                )
-
-            # 调用转写（带回调和断点续传）
-            transcript = audio_to_text(
-                audio_path,
-                model_size="tiny",
-                language="zh",
-                progress_callback=on_chunk_completed,
-                resume_from_chunks=resume_chunks,
-            )
-            update_task_content(task_id, transcript_text=transcript)
-
-            update_task_status(task_id, TaskStatus.SUMMARIZING.value)
-            status_box.write("总结中（LLM）...")
-            summary = generate_summary(transcript, system_prompt=_get_active_prompt())
-            update_task_content(task_id, summary_text=summary)
-
-            update_task_status(task_id, TaskStatus.COMPLETED.value)
-            status_box.update(label="处理完成", state="complete")
-        except Exception as exc:  # noqa: BLE001
-            # 保存部分结果
             partial_transcript = assemble_partial_transcript(task_id)
             if partial_transcript:
                 update_task_content(task_id, transcript_text=partial_transcript)
-                status_box.warning(f"转写部分完成（{len(partial_transcript)} 字符），但遇到错误")
-
-            update_task_status(task_id, TaskStatus.FAILED.value)
-            status_box.update(label="处理失败", state="error")
-            status_box.write(f"错误：{exc}")
-        finally:
-            st.session_state.running_task_id = None
+        except Exception:  # noqa: BLE001
+            pass
+        _mark_task_failed_safely(task_id, str(exc))
 
 
 def _render_running_task(task_id: int) -> None:
-    st.info(f"正在处理任务 #{task_id}，请稍候...")
+    try:
+        task = get_task(task_id)
+    except Exception:  # noqa: BLE001
+        st.info(f"正在处理任务 #{task_id}，请稍候...")
+        return
+
+    if not task:
+        st.session_state.running_task_id = None
+        return
+
+    active_statuses = {
+        TaskStatus.WAITING.value,
+        TaskStatus.DOWNLOADING.value,
+        TaskStatus.TRANSCRIBING.value,
+        TaskStatus.SUMMARIZING.value,
+    }
+    if task.status in active_statuses:
+        st.info(f"正在处理任务 #{task_id}（{STATUS_MAP.get(task.status, task.status)}），请稍候...")
+    else:
+        st.session_state.running_task_id = None
 
 
 def _render_history() -> None:
@@ -405,6 +415,23 @@ def _render_db_not_ready_hint(exc: Exception, button_key: str) -> None:
     if st.button("立即初始化数据库", key=button_key, type="primary", use_container_width=True):
         if _initialize_database(show_feedback=True):
             st.rerun()
+
+
+def _mark_task_failed_safely(task_id: int, error_text: str) -> None:
+    """尽力将任务标记为失败，避免卡在 waiting/transcribing。"""
+    try:
+        update_task_status(task_id, TaskStatus.FAILED.value)
+    except Exception:  # noqa: BLE001
+        return
+
+    # 可选补充一条可见错误信息，避免空白失败记录。
+    try:
+        task = get_task(task_id)
+        has_any_content = bool(task and ((task.transcript_text and task.transcript_text.strip()) or (task.summary_text and task.summary_text.strip())))
+        if not has_any_content:
+            update_task_content(task_id, summary_text=f"[系统] 任务异常终止：{error_text}")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _cleanup_files() -> int:
