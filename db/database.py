@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -35,8 +36,15 @@ DB_FILE_NAME = "app.db"
 DEFAULT_DB_PATH = DB_PATH
 REMOTE_DB_SCHEMES = ("libsql://", "https://", "http://")
 TURSO_SYNC_INTERVAL_SECONDS = 15.0
+TURSO_SYNC_FAILURE_BACKOFF_SECONDS = 60.0
+TURSO_SYNC_FAILURE_LOG_INTERVAL_SECONDS = 30.0
 _TURSO_SYNC_LOCK = threading.Lock()
 _LAST_TURSO_SYNC_MONOTONIC = 0.0
+_NEXT_TURSO_SYNC_RETRY_MONOTONIC = 0.0
+_LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC = 0.0
+LOGGER = logging.getLogger(__name__)
+_INIT_DB_LOCK = threading.Lock()
+_INITIALIZED_DB_TARGETS: set[str] = set()
 
 
 class TaskStatus(str, Enum):
@@ -120,30 +128,42 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
     Args:
         db_path: 数据库文件路径，默认使用项目根目录下 data/app.db。
     """
-    with get_connection(db_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bilibili_url TEXT NOT NULL,
-                video_title TEXT NOT NULL,
-                video_duration_seconds INTEGER,
-                audio_file_path TEXT,
-                transcript_text TEXT,
-                summary_text TEXT,
-                status TEXT NOT NULL DEFAULT 'waiting',
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    init_key = _build_init_key(db_path)
+    with _INIT_DB_LOCK:
+        if init_key in _INITIALIZED_DB_TARGETS:
+            return
+
+        # Turso 场景优先使用本地 replica 快速校验，避免每次启动触发慢初始化。
+        if _should_use_turso(db_path) and _is_local_replica_schema_ready():
+            _INITIALIZED_DB_TARGETS.add(init_key)
+            return
+
+        with get_connection(db_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bilibili_url TEXT NOT NULL,
+                    video_title TEXT NOT NULL,
+                    video_duration_seconds INTEGER,
+                    audio_file_path TEXT,
+                    transcript_text TEXT,
+                    summary_text TEXT,
+                    status TEXT NOT NULL DEFAULT 'waiting',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at DESC)"
-        )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status)"
-        )
-        connection.commit()
-        _ensure_extra_columns(connection)
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status)"
+            )
+            _commit_connection(connection, sync_remote=False)
+            _ensure_extra_columns(connection)
+
+        _INITIALIZED_DB_TARGETS.add(init_key)
 
 
 def create_task(
@@ -188,7 +208,7 @@ def create_task(
                 normalized_status,
             ),
         )
-        connection.commit()
+        _commit_connection(connection, sync_remote=True)
         return int(cursor.lastrowid)
 
 
@@ -318,7 +338,7 @@ def delete_task(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> None:
     """
     with get_connection(db_path) as connection:
         connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        connection.commit()
+        _commit_connection(connection, sync_remote=True)
 
 
 def delete_tasks_before(days: int, db_path: Path | str = DEFAULT_DB_PATH) -> int:
@@ -336,7 +356,7 @@ def delete_tasks_before(days: int, db_path: Path | str = DEFAULT_DB_PATH) -> int
             "DELETE FROM tasks WHERE created_at < datetime('now', ?)",
             (f"-{int(days)} days",),
         )
-        connection.commit()
+        _commit_connection(connection, sync_remote=True)
         return cursor.rowcount
 
 
@@ -357,7 +377,7 @@ def delete_tasks_by_status(
         cursor = connection.execute(
             f"DELETE FROM tasks WHERE status IN ({placeholders})", tuple(statuses)
         )
-        connection.commit()
+        _commit_connection(connection, sync_remote=True)
         return cursor.rowcount
 
 
@@ -422,7 +442,7 @@ def _update_fields(
             f"UPDATE tasks SET {columns} WHERE id = ?",  # 安全：列名已通过白名单校验
             tuple(values),
         )
-        connection.commit()
+        _commit_connection(connection, sync_remote=True)
 
 
 def _normalize_db_path(db_path: Path | str) -> Path:
@@ -430,6 +450,56 @@ def _normalize_db_path(db_path: Path | str) -> Path:
     path = Path(db_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _build_init_key(db_path: Path | str) -> str:
+    if _should_use_turso(db_path):
+        url = _resolve_turso_url(db_path)
+        replica = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
+        return f"turso::{url}::{replica}"
+    return f"sqlite::{_normalize_db_path(db_path)}"
+
+
+def _is_local_replica_schema_ready() -> bool:
+    """检查 Turso 本地 replica 是否已有完整 schema。"""
+    replica_path = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
+    if not replica_path.exists():
+        return False
+
+    required_columns = {
+        "id",
+        "bilibili_url",
+        "video_title",
+        "video_duration_seconds",
+        "audio_file_path",
+        "transcript_text",
+        "summary_text",
+        "status",
+        "created_at",
+        "transcription_progress",
+        "transcription_total_chunks",
+        "transcription_completed_chunks",
+    }
+    connection: Optional[sqlite3.Connection] = None
+    try:
+        connection = sqlite3.connect(str(replica_path))
+        cursor = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tasks'"
+        )
+        if int(cursor.fetchone()[0]) == 0:
+            return False
+
+        table_info = connection.execute("PRAGMA table_info(tasks)").fetchall()
+        columns = {str(row[1]) for row in table_info}
+        return required_columns.issubset(columns)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _is_remote_target(db_path: Path | str) -> bool:
@@ -481,8 +551,13 @@ def _connect_turso(db_path: Path | str) -> Any:
     # 与本地 sqlite 行为保持一致，便于 row["field"] 访问。
     if hasattr(connection, "row_factory"):
         connection.row_factory = sqlite3.Row
-    _sync_turso_if_needed(connection, force=False)
     return connection
+
+
+def _commit_connection(connection: Any, sync_remote: bool) -> None:
+    connection.commit()
+    if sync_remote and hasattr(connection, "sync"):
+        _sync_turso_if_needed(connection, force=False)
 
 
 def _sync_turso_if_needed(connection: Any, force: bool = False) -> None:
@@ -490,16 +565,42 @@ def _sync_turso_if_needed(connection: Any, force: bool = False) -> None:
         return
 
     global _LAST_TURSO_SYNC_MONOTONIC  # noqa: PLW0603
+    global _NEXT_TURSO_SYNC_RETRY_MONOTONIC  # noqa: PLW0603
     now = time.monotonic()
+    if not force and now < _NEXT_TURSO_SYNC_RETRY_MONOTONIC:
+        return
     if not force and (now - _LAST_TURSO_SYNC_MONOTONIC) < TURSO_SYNC_INTERVAL_SECONDS:
         return
 
     with _TURSO_SYNC_LOCK:
         now = time.monotonic()
+        if not force and now < _NEXT_TURSO_SYNC_RETRY_MONOTONIC:
+            return
         if not force and (now - _LAST_TURSO_SYNC_MONOTONIC) < TURSO_SYNC_INTERVAL_SECONDS:
             return
-        connection.sync()
-        _LAST_TURSO_SYNC_MONOTONIC = time.monotonic()
+        try:
+            connection.sync()
+            _LAST_TURSO_SYNC_MONOTONIC = time.monotonic()
+            _NEXT_TURSO_SYNC_RETRY_MONOTONIC = 0.0
+        except Exception as exc:  # noqa: BLE001
+            _NEXT_TURSO_SYNC_RETRY_MONOTONIC = (
+                time.monotonic() + TURSO_SYNC_FAILURE_BACKOFF_SECONDS
+            )
+            _log_turso_sync_failure(exc)
+
+
+def _log_turso_sync_failure(exc: Exception) -> None:
+    """Turso 同步失败时限流打印日志，避免刷屏。"""
+    global _LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC  # noqa: PLW0603
+    now = time.monotonic()
+    if (now - _LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC) < TURSO_SYNC_FAILURE_LOG_INTERVAL_SECONDS:
+        return
+
+    _LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC = now
+    LOGGER.warning(
+        "Turso sync 失败，已降级使用本地 replica，稍后自动重试。错误：%s",
+        exc,
+    )
 
 
 def _validate_status(status: str) -> str:
@@ -530,7 +631,7 @@ def _ensure_transcription_columns(connection: sqlite3.Connection) -> None:
     if "transcription_completed_chunks" not in existing:
         connection.execute("ALTER TABLE tasks ADD COLUMN transcription_completed_chunks INTEGER;")
 
-    connection.commit()
+    _commit_connection(connection, sync_remote=False)
 
 
 def update_transcription_progress(
@@ -609,7 +710,7 @@ def update_transcription_progress(
             """,
             (json.dumps(progress, ensure_ascii=False), total_chunks, completed_count, task_id)
         )
-        connection.commit()
+        _commit_connection(connection, sync_remote=True)
 
 
 def get_transcription_progress(

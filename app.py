@@ -17,7 +17,7 @@ from yt_dlp import YoutubeDL
 
 from utils.network import get_lan_addresses
 from utils.url_helper import process_user_input
-from config import DEFAULT_LLM_MODEL, DOWNLOAD_DIR, ensure_api_key_present
+from config import DB_AUTO_INIT_ON_STARTUP, DEFAULT_LLM_MODEL, DOWNLOAD_DIR, ensure_api_key_present
 from core.downloader import download_audio
 from core.summarizer import generate_summary
 from core.transcriber import audio_to_text
@@ -64,8 +64,9 @@ def main() -> None:
         st.error(str(exc))
         return
     if "db_initialized" not in st.session_state:
-        init_db()
-        st.session_state.db_initialized = True
+        st.session_state.db_initialized = False
+    if not st.session_state.db_initialized and DB_AUTO_INIT_ON_STARTUP:
+        _initialize_database(show_feedback=False)
     ensure_dir(DOWNLOAD_DIR)
 
     if "running_task_id" not in st.session_state:
@@ -91,12 +92,15 @@ def main() -> None:
         )
 
     if run_btn and user_input:
-        # 提取并清洗 URL
-        url = process_user_input(user_input)
-        if not url:
-            st.error("无法识别有效的 B 站链接，请检查输入格式")
+        if not st.session_state.db_initialized and not _probe_database_ready():
+            st.error("数据库尚未初始化。请在左侧“设置与清理 -> 数据库维护”中手动初始化。")
         else:
-            st.session_state.running_task_id = _start_task(url)
+            # 提取并清洗 URL
+            url = process_user_input(user_input)
+            if not url:
+                st.error("无法识别有效的 B 站链接，请检查输入格式")
+            else:
+                st.session_state.running_task_id = _start_task(url)
 
     if st.session_state.running_task_id is not None:
         _render_running_task(st.session_state.running_task_id)
@@ -200,7 +204,13 @@ def _render_running_task(task_id: int) -> None:
 
 def _render_history() -> None:
     st.subheader("历史记录")
-    tasks = list_tasks(limit=50, include_content=False)
+    try:
+        tasks = list_tasks(limit=50, include_content=False)
+        st.session_state.db_initialized = True
+    except Exception as exc:  # noqa: BLE001
+        _render_db_not_ready_hint(exc, button_key="init_db_from_history")
+        return
+
     if not tasks:
         st.write("暂无记录")
         return
@@ -211,7 +221,12 @@ def _render_history() -> None:
         options=list(options.keys()),
         format_func=lambda tid: options.get(tid, str(tid)),
     )
-    task = get_task(selected_id)
+    try:
+        task = get_task(selected_id)
+    except Exception as exc:  # noqa: BLE001
+        _render_db_not_ready_hint(exc, button_key="init_db_from_history_get")
+        return
+
     if not task:
         st.warning("任务不存在")
         return
@@ -285,6 +300,13 @@ def _render_history() -> None:
 
 def _render_settings() -> None:
     st.subheader("设置与清理")
+    with st.expander("数据库维护", expanded=False):
+        auto_init_text = "开启" if DB_AUTO_INIT_ON_STARTUP else "关闭"
+        st.caption(f"启动时自动初始化：{auto_init_text}（环境变量：DB_AUTO_INIT_ON_STARTUP）")
+        if st.button("手动初始化/校验数据库", use_container_width=True, key="init_db_from_settings"):
+            if _initialize_database(show_feedback=True):
+                st.rerun()
+
     with st.expander("总结 Prompt", expanded=False):
         default_prompt = _DEFAULT_PROMPT
         user_prompt = st.text_area(
@@ -350,6 +372,39 @@ def _render_regen_dialog(task: Task) -> None:
                 st.session_state["regen_task_id"] = None
 
     _dialog()
+
+
+def _initialize_database(show_feedback: bool) -> bool:
+    """执行数据库初始化，并更新会话内状态。"""
+    try:
+        init_db()
+        st.session_state.db_initialized = True
+        if show_feedback:
+            st.success("数据库初始化完成")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        st.session_state.db_initialized = False
+        if show_feedback:
+            st.error(f"数据库初始化失败：{exc}")
+        return False
+
+
+def _probe_database_ready() -> bool:
+    """轻量探测数据库可用性，不做初始化。"""
+    try:
+        list_tasks(limit=1, include_content=False)
+        st.session_state.db_initialized = True
+        return True
+    except Exception:  # noqa: BLE001
+        st.session_state.db_initialized = False
+        return False
+
+
+def _render_db_not_ready_hint(exc: Exception, button_key: str) -> None:
+    st.warning(f"数据库暂不可用：{exc}")
+    if st.button("立即初始化数据库", key=button_key, type="primary", use_container_width=True):
+        if _initialize_database(show_feedback=True):
+            st.rerun()
 
 
 def _cleanup_files() -> int:

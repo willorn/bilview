@@ -41,6 +41,13 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_api_key(env_name: str, default: Optional[str] = None) -> Optional[str]:
     """通用读取 API Key 的函数。"""
     return os.getenv(env_name, default)
@@ -50,6 +57,7 @@ def get_api_key(env_name: str, default: Optional[str] = None) -> Optional[str]:
 X666_API_KEY = get_api_key("X666_API_KEY")
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+DB_AUTO_INIT_ON_STARTUP = _env_bool("DB_AUTO_INIT_ON_STARTUP", default=False)
 
 
 def ensure_api_key_present() -> None:

@@ -74,6 +74,7 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
 ### 配置要点
 - Python 版本建议 3.10/3.12；若平台固定为 3.13，请确保 `audioop-lts` 已安装（requirements 已按条件依赖声明），或通过 `runtime.txt` 指定 3.12。
 - `.env`：`X666_API_KEY`（优先）；如配置 `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`，默认数据库会自动切到 Turso。  
+- 可选：`DB_AUTO_INIT_ON_STARTUP=1` 启动时自动执行数据库初始化（默认关闭，推荐在“设置与清理 -> 数据库维护”手动触发）。  
 - `config.py`：`DEFAULT_LLM_API_URL`、`DEFAULT_LLM_MODEL`、`DB_PATH`、`DOWNLOAD_DIR` 等集中管理。  
 - 状态枚举：DB 中存英文 (`waiting/downloading/...`)，UI 层通过 `STATUS_MAP` 映射中文。
 
