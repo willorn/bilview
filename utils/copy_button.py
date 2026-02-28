@@ -3,7 +3,21 @@
 
 提供可复用的 HTML + JavaScript 代码生成器，避免代码重复。
 """
-from typing import Optional
+import html as html_lib
+import json
+import re
+
+
+def _sanitize_button_id(raw_id: str) -> str:
+    """
+    将任意字符串转换为可用于 DOM id / JS 标识符的安全 ID。
+    """
+    safe = re.sub(r"\W", "_", raw_id)
+    if not safe:
+        return "copy_btn"
+    if safe[0].isdigit():
+        return f"copy_{safe}"
+    return safe
 
 
 def create_copy_button_with_tooltip(
@@ -34,14 +48,19 @@ def create_copy_button_with_tooltip(
     Returns:
         完整的 HTML + JavaScript 代码字符串
     """
-    # 安全转义文本
-    escaped_text = repr(text_to_copy)
+    safe_id = _sanitize_button_id(button_id)
+    escaped_text = json.dumps(text_to_copy)
+    escaped_button_text = html_lib.escape(button_text)
+    escaped_success_message = json.dumps(success_message)
+    escaped_error_message = json.dumps(error_message)
+    escaped_button_color = json.dumps(button_color)
+    escaped_button_hover_color = json.dumps(button_hover_color)
 
-    html = f"""
-    <div style="position: relative;">
+    markup = f"""
+    <div style="width: 100%; position: relative; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
         <button
-            onclick="copyToClipboard_{button_id}()"
-            id="copyBtn_{button_id}"
+            onclick="copyToClipboard_{safe_id}()"
+            id="copyBtn_{safe_id}"
             style="
                 width: 100%;
                 padding: 0.5rem 1rem;
@@ -54,70 +73,78 @@ def create_copy_button_with_tooltip(
                 font-weight: 500;
                 transition: background-color 0.2s;
             "
-            onmouseover="this.style.backgroundColor='{button_hover_color}'"
-            onmouseout="this.style.backgroundColor='{button_color}'">
-            {button_text}
+            onmouseover="this.style.backgroundColor={escaped_button_hover_color}"
+            onmouseout="this.style.backgroundColor={escaped_button_color}">
+            {escaped_button_text}
         </button>
         <div
-            id="tooltip_{button_id}"
+            id="tooltip_{safe_id}"
             style="
-                position: absolute;
-                bottom: 110%;
-                left: 50%;
-                transform: translateX(-50%);
+                margin-top: 0.4rem;
                 background-color: #262730;
                 color: white;
-                padding: 0.5rem 1rem;
+                padding: 0.35rem 0.65rem;
                 border-radius: 0.375rem;
-                font-size: 0.875rem;
-                white-space: nowrap;
+                font-size: 0.8rem;
                 opacity: 0;
                 pointer-events: none;
                 transition: opacity 0.3s;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+                display: inline-block;
                 z-index: 1000;
             "></div>
     </div>
     <script>
-    function copyToClipboard_{button_id}() {{
+    async function copyToClipboard_{safe_id}() {{
         const text = {escaped_text};
-        const tooltip = document.getElementById('tooltip_{button_id}');
-        const button = document.getElementById('copyBtn_{button_id}');
+        const tooltip = document.getElementById('tooltip_{safe_id}');
+        const button = document.getElementById('copyBtn_{safe_id}');
+        const originalText = button.textContent;
 
-        navigator.clipboard.writeText(text).then(
-            function() {{
-                // 成功提示
-                tooltip.textContent = '{success_message}';
-                tooltip.style.backgroundColor = '#0e7c3a';
-                tooltip.style.opacity = '1';
+        function showTooltip(message, color, duration) {{
+            tooltip.textContent = message;
+            tooltip.style.backgroundColor = color;
+            tooltip.style.opacity = '1';
+            setTimeout(function() {{
+                tooltip.style.opacity = '0';
+            }}, duration);
+        }}
 
-                // 按钮反馈
-                const originalText = button.textContent;
-                button.textContent = '✓ 已复制';
-                button.style.backgroundColor = '#0e7c3a';
+        try {{
+            if (navigator.clipboard && window.isSecureContext) {{
+                await navigator.clipboard.writeText(text);
+            }} else {{
+                // 不满足 clipboard API 条件时，退回旧方案。
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.setAttribute('readonly', '');
+                textarea.style.position = 'fixed';
+                textarea.style.left = '-9999px';
+                document.body.appendChild(textarea);
+                textarea.select();
 
-                // 自动恢复
-                setTimeout(function() {{
-                    tooltip.style.opacity = '0';
-                    button.textContent = originalText;
-                    button.style.backgroundColor = '{button_color}';
-                }}, {success_duration});
-            }},
-            function(err) {{
-                // 失败提示
-                tooltip.textContent = '{error_message}';
-                tooltip.style.backgroundColor = '#dc2626';
-                tooltip.style.opacity = '1';
-
-                setTimeout(function() {{
-                    tooltip.style.opacity = '0';
-                }}, {error_duration});
+                const copied = document.execCommand('copy');
+                document.body.removeChild(textarea);
+                if (!copied) {{
+                    throw new Error('execCommand copy failed');
+                }}
             }}
-        );
+
+            button.textContent = '✓ 已复制';
+            button.style.backgroundColor = '#0e7c3a';
+            showTooltip({escaped_success_message}, '#0e7c3a', {success_duration});
+
+            setTimeout(function() {{
+                button.textContent = originalText;
+                button.style.backgroundColor = {escaped_button_color};
+            }}, {success_duration});
+        }} catch (err) {{
+            console.error('复制失败:', err);
+            showTooltip({escaped_error_message}, '#dc2626', {error_duration});
+        }}
     }}
     </script>
     """
-    return html
+    return markup
 
 
 # 便捷函数：为 Streamlit 任务生成复制按钮

@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Optional
 
 import streamlit as st
+import streamlit.components.v1 as components
 from yt_dlp import YoutubeDL
 
 from utils.network import get_lan_addresses
 from utils.url_helper import process_user_input
-from config import DOWNLOAD_DIR, ensure_api_key_present
+from config import DEFAULT_LLM_MODEL, DOWNLOAD_DIR, ensure_api_key_present
 from core.downloader import download_audio
 from core.summarizer import generate_summary
 from core.transcriber import audio_to_text
@@ -37,7 +38,6 @@ from db.database import (
     update_transcription_progress,
 )
 from utils.copy_button import create_task_copy_button
-from utils.download_button import create_download_button
 from utils.file_helper import ensure_dir
 
 STATUS_MAP = {
@@ -223,29 +223,37 @@ def _render_history() -> None:
         st.markdown("**转录文本**")
         st.text_area("transcript", value=task.transcript_text or "", height=400, label_visibility="collapsed")
         if task.transcript_text:
-            transcript_download = create_download_button(
-                button_id=f"transcript_{task.id}",
-                content=task.transcript_text,
-                filename=f"task_{task.id}_transcript.txt",
+            st.download_button(
                 label="下载逐字稿 (.txt)",
+                data=task.transcript_text,
+                file_name=f"task_{task.id}_transcript.txt",
                 mime="text/plain",
+                type="primary",
+                use_container_width=True,
+                key=f"download_transcript_{task.id}",
             )
-            st.markdown(transcript_download, unsafe_allow_html=True)
             # 使用工具函数生成复制按钮
             copy_button_html = create_task_copy_button(task.id, task.transcript_text)
-            st.markdown(copy_button_html, unsafe_allow_html=True)
+            components.html(copy_button_html, height=90, scrolling=False)
     with right:
         st.markdown("**总结结果**")
         st.text_area("summary", value=task.summary_text or "", height=400, label_visibility="collapsed")
         if task.summary_text:
-            summary_download = create_download_button(
-                button_id=f"summary_{task.id}",
-                content=task.summary_text,
-                filename=f"task_{task.id}_summary.md",
+            st.download_button(
                 label="下载总结 (.md)",
+                data=task.summary_text,
+                file_name=f"task_{task.id}_summary.md",
                 mime="text/markdown",
+                type="primary",
+                use_container_width=True,
+                key=f"download_summary_{task.id}",
             )
-            st.markdown(summary_download, unsafe_allow_html=True)
+            summary_copy_button_html = create_task_copy_button(
+                task_id=task.id,
+                text_to_copy=task.summary_text,
+                button_text="复制总结",
+            )
+            components.html(summary_copy_button_html, height=90, scrolling=False)
 
     st.caption(
         f"任务状态：{STATUS_MAP.get(task.status, task.status)}，"

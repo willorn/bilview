@@ -67,7 +67,7 @@ def create_download_button(
         const mime = {safe_mime};
 
         try {{
-          const blob = new Blob([content], {{ type: `${{mime}};charset=utf-8` }});
+          const blob = new Blob([content], {{ type: mime + ';charset=utf-8' }});
           const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent);
 
           if (typeof navigator !== 'undefined' && navigator.msSaveOrOpenBlob) {{
