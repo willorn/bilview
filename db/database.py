@@ -9,18 +9,34 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
-from config import DB_PATH
+from config import (
+    DB_PATH,
+    TURSO_AUTH_TOKEN,
+    TURSO_DATABASE_URL,
+    TURSO_LOCAL_REPLICA_PATH,
+)
+
+try:
+    import libsql  # type: ignore
+except ImportError:  # pragma: no cover - 由运行环境决定是否安装 libsql
+    libsql = None
 
 CONNECTION_TIMEOUT_SECONDS = 30
 DATA_DIR_NAME = "data"
 DB_FILE_NAME = "app.db"
 DEFAULT_DB_PATH = DB_PATH
+REMOTE_DB_SCHEMES = ("libsql://", "https://", "http://")
+TURSO_SYNC_INTERVAL_SECONDS = 15.0
+_TURSO_SYNC_LOCK = threading.Lock()
+_LAST_TURSO_SYNC_MONOTONIC = 0.0
 
 
 class TaskStatus(str, Enum):
@@ -54,8 +70,20 @@ class Task:
     created_at: str
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Task":
+    def from_row(cls, row: Any) -> "Task":
         """将 sqlite3.Row 转换为 Task 数据类。"""
+        if _is_sequence_row(row):
+            return cls(
+                id=row[0],
+                bilibili_url=row[1],
+                video_title=row[2],
+                video_duration_seconds=row[3],
+                audio_file_path=row[4],
+                transcript_text=row[5],
+                summary_text=row[6],
+                status=row[7],
+                created_at=row[8],
+            )
         return cls(
             id=row["id"],
             bilibili_url=row["bilibili_url"],
@@ -69,6 +97,22 @@ class Task:
         )
 
 
+def _is_sequence_row(row: Any) -> bool:
+    return isinstance(row, (tuple, list))
+
+
+def _table_info_name(row: Any) -> str:
+    if _is_sequence_row(row):
+        return str(row[1])
+    return str(row["name"])
+
+
+def _single_column_value(row: Any, key: str) -> Any:
+    if _is_sequence_row(row):
+        return row[0]
+    return row[key]
+
+
 def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
     """
     初始化 SQLite 数据库，创建 tasks 表和必要索引。
@@ -76,9 +120,8 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
     Args:
         db_path: 数据库文件路径，默认使用项目根目录下 data/app.db。
     """
-    path = _normalize_db_path(db_path)
-    with get_connection(path) as connection:
-        connection.executescript(
+    with get_connection(db_path) as connection:
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,10 +133,14 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
                 summary_text TEXT,
                 status TEXT NOT NULL DEFAULT 'waiting',
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status);
+            )
             """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status)"
         )
         connection.commit()
         _ensure_extra_columns(connection)
@@ -221,7 +268,9 @@ def get_task(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> Optional[Ta
 
 
 def list_tasks(
-    limit: Optional[int] = None, db_path: Path | str = DEFAULT_DB_PATH
+    limit: Optional[int] = None,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    include_content: bool = True,
 ) -> List[Task]:
     """
     获取任务列表，按创建时间倒序排列。
@@ -229,16 +278,25 @@ def list_tasks(
     Args:
         limit: 限制返回的最大行数，None 时返回全部。
         db_path: 数据库文件路径。
+        include_content: 是否返回 transcript/summary 全文。
 
     Returns:
         Task 对象列表。
     """
-    sql = """
-    SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
-           transcript_text, summary_text, status, created_at
-    FROM tasks
-    ORDER BY datetime(created_at) DESC
-    """
+    if include_content:
+        sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               transcript_text, summary_text, status, created_at
+        FROM tasks
+        ORDER BY datetime(created_at) DESC
+        """
+    else:
+        sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               NULL AS transcript_text, NULL AS summary_text, status, created_at
+        FROM tasks
+        ORDER BY datetime(created_at) DESC
+        """
     params: tuple[Any, ...] = ()
     if isinstance(limit, int) and limit > 0:
         sql += " LIMIT ?"
@@ -306,7 +364,7 @@ def delete_tasks_by_status(
 @contextmanager
 def get_connection(
     db_path: Path | str = DEFAULT_DB_PATH,
-) -> Generator[sqlite3.Connection, None, None]:
+) -> Generator[Any, None, None]:
     """
     生成带有基础配置的数据库连接上下文。
 
@@ -316,14 +374,18 @@ def get_connection(
     Yields:
         已配置 row_factory 的 sqlite3.Connection。
     """
-    path = _normalize_db_path(db_path)
-    connection = sqlite3.connect(
-        str(path),
-        timeout=CONNECTION_TIMEOUT_SECONDS,
-        check_same_thread=False,
-        detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
-    )
-    connection.row_factory = sqlite3.Row
+    use_turso = _should_use_turso(db_path)
+    if use_turso:
+        connection = _connect_turso(db_path)
+    else:
+        path = _normalize_db_path(db_path)
+        connection = sqlite3.connect(
+            str(path),
+            timeout=CONNECTION_TIMEOUT_SECONDS,
+            check_same_thread=False,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        )
+        connection.row_factory = sqlite3.Row
     try:
         yield connection
     finally:
@@ -370,6 +432,76 @@ def _normalize_db_path(db_path: Path | str) -> Path:
     return path
 
 
+def _is_remote_target(db_path: Path | str) -> bool:
+    target = str(db_path).strip()
+    return any(target.startswith(scheme) for scheme in REMOTE_DB_SCHEMES)
+
+
+def _is_default_db_path(db_path: Path | str) -> bool:
+    try:
+        return Path(db_path).expanduser().resolve() == Path(DEFAULT_DB_PATH).expanduser().resolve()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _should_use_turso(db_path: Path | str) -> bool:
+    if _is_remote_target(db_path):
+        return True
+    if _is_default_db_path(db_path) and TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
+        return True
+    return False
+
+
+def _resolve_turso_url(db_path: Path | str) -> str:
+    if _is_remote_target(db_path):
+        return str(db_path)
+    if TURSO_DATABASE_URL:
+        return TURSO_DATABASE_URL
+    raise RuntimeError("未配置 TURSO_DATABASE_URL，无法连接 Turso。")
+
+
+def _connect_turso(db_path: Path | str) -> Any:
+    if libsql is None:
+        raise RuntimeError(
+            "已启用 Turso 连接，但未安装 libsql 依赖。请先执行: pip install libsql"
+        )
+
+    turso_url = _resolve_turso_url(db_path)
+    auth_token = TURSO_AUTH_TOKEN
+    if not auth_token:
+        raise RuntimeError("已启用 Turso 连接，但缺少 TURSO_AUTH_TOKEN。")
+
+    replica_path = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
+    connection = libsql.connect(
+        str(replica_path),
+        sync_url=turso_url,
+        auth_token=auth_token,
+    )
+
+    # 与本地 sqlite 行为保持一致，便于 row["field"] 访问。
+    if hasattr(connection, "row_factory"):
+        connection.row_factory = sqlite3.Row
+    _sync_turso_if_needed(connection, force=False)
+    return connection
+
+
+def _sync_turso_if_needed(connection: Any, force: bool = False) -> None:
+    if not hasattr(connection, "sync"):
+        return
+
+    global _LAST_TURSO_SYNC_MONOTONIC  # noqa: PLW0603
+    now = time.monotonic()
+    if not force and (now - _LAST_TURSO_SYNC_MONOTONIC) < TURSO_SYNC_INTERVAL_SECONDS:
+        return
+
+    with _TURSO_SYNC_LOCK:
+        now = time.monotonic()
+        if not force and (now - _LAST_TURSO_SYNC_MONOTONIC) < TURSO_SYNC_INTERVAL_SECONDS:
+            return
+        connection.sync()
+        _LAST_TURSO_SYNC_MONOTONIC = time.monotonic()
+
+
 def _validate_status(status: str) -> str:
     """校验并返回合法状态值。"""
     if status not in TaskStatus.values():
@@ -380,7 +512,7 @@ def _validate_status(status: str) -> str:
 def _ensure_extra_columns(connection: sqlite3.Connection) -> None:
     """为旧表补充新增列，避免因 schema 变更导致异常。"""
     cursor = connection.execute("PRAGMA table_info(tasks);")
-    existing = {row["name"] for row in cursor.fetchall()}
+    existing = {_table_info_name(row) for row in cursor.fetchall()}
     if "video_duration_seconds" not in existing:
         connection.execute("ALTER TABLE tasks ADD COLUMN video_duration_seconds INTEGER;")
     _ensure_transcription_columns(connection)
@@ -389,7 +521,7 @@ def _ensure_extra_columns(connection: sqlite3.Connection) -> None:
 def _ensure_transcription_columns(connection: sqlite3.Connection) -> None:
     """为转写进度功能添加必要字段（幂等操作）。"""
     cursor = connection.execute("PRAGMA table_info(tasks);")
-    existing = {row["name"] for row in cursor.fetchall()}
+    existing = {_table_info_name(row) for row in cursor.fetchall()}
 
     if "transcription_progress" not in existing:
         connection.execute("ALTER TABLE tasks ADD COLUMN transcription_progress TEXT;")
@@ -432,7 +564,7 @@ def update_transcription_progress(
         if not row:
             return
 
-        existing_json = row["transcription_progress"]
+        existing_json = _single_column_value(row, "transcription_progress")
         if existing_json:
             progress = json.loads(existing_json)
         else:
@@ -499,9 +631,12 @@ def get_transcription_progress(
             (task_id,)
         )
         row = cursor.fetchone()
-        if not row or not row["transcription_progress"]:
+        if not row:
             return None
-        return json.loads(row["transcription_progress"])
+        progress_raw = _single_column_value(row, "transcription_progress")
+        if not progress_raw:
+            return None
+        return json.loads(progress_raw)
 
 
 def assemble_partial_transcript(

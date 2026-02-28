@@ -63,7 +63,9 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         st.error(str(exc))
         return
-    init_db()
+    if "db_initialized" not in st.session_state:
+        init_db()
+        st.session_state.db_initialized = True
     ensure_dir(DOWNLOAD_DIR)
 
     if "running_task_id" not in st.session_state:
@@ -198,7 +200,7 @@ def _render_running_task(task_id: int) -> None:
 
 def _render_history() -> None:
     st.subheader("历史记录")
-    tasks = list_tasks(limit=50)
+    tasks = list_tasks(limit=50, include_content=False)
     if not tasks:
         st.write("暂无记录")
         return

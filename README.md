@@ -4,7 +4,7 @@
 
 ### 主要特性
 - **全本地转写**：内置 Whisper（默认 tiny，可切换 base/small…），避免在线 ASR 成本。
-- **一键流程**：Streamlit 界面触发，自动串联下载 / 转写 / 总结并写入 SQLite。
+- **一键流程**：Streamlit 界面触发，自动串联下载 / 转写 / 总结并写入数据库（默认 SQLite，可切换 Turso）。
 - **结果持久化**：默认写入 `/data/data/app.db`（如存在 HF /data 持久卷），否则使用仓库内 `data/app.db`，并可用环境变量 `BILVIEW_STORAGE_DIR` 自定义。
 - **可配置 LLM**：默认 `gemini-2.5-pro-1m`（x666 接口），支持自定义模型、温度、API Key。
 - **安全实践**：状态存储英文枚举，UI 层中文映射；SQL 全部使用占位符。
@@ -46,6 +46,12 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
    X666_API_KEY=你的key
    ```
 
+   若使用 Turso（云端免费数据库），额外配置：
+   ```
+   TURSO_DATABASE_URL=libsql://xxx.turso.io
+   TURSO_AUTH_TOKEN=你的turso-token
+   ```
+
 
 3) 启动前端  
    ```bash
@@ -67,7 +73,7 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
 
 ### 配置要点
 - Python 版本建议 3.10/3.12；若平台固定为 3.13，请确保 `audioop-lts` 已安装（requirements 已按条件依赖声明），或通过 `runtime.txt` 指定 3.12。
-- `.env`：`X666_API_KEY`（优先）  
+- `.env`：`X666_API_KEY`（优先）；如配置 `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`，默认数据库会自动切到 Turso。  
 - `config.py`：`DEFAULT_LLM_API_URL`、`DEFAULT_LLM_MODEL`、`DB_PATH`、`DOWNLOAD_DIR` 等集中管理。  
 - 状态枚举：DB 中存英文 (`waiting/downloading/...`)，UI 层通过 `STATUS_MAP` 映射中文。
 

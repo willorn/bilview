@@ -22,6 +22,9 @@ STORAGE_ROOT = Path(
 DATA_DIR = STORAGE_ROOT / "data"
 DOWNLOAD_DIR = STORAGE_ROOT / "downloads"
 DB_PATH = DATA_DIR / "app.db"
+TURSO_LOCAL_REPLICA_PATH = Path(
+    os.getenv("TURSO_LOCAL_REPLICA_PATH", DATA_DIR / "turso_replica.db")
+).expanduser().resolve()
 
 DEFAULT_LLM_API_URL = "https://x666.me/v1/chat/completions"
 DEFAULT_LLM_MODEL = "gemini-2.5-pro-1m"
@@ -45,6 +48,8 @@ def get_api_key(env_name: str, default: Optional[str] = None) -> Optional[str]:
 
 # 项目内默认使用的 key（可在 .env 中覆盖）
 X666_API_KEY = get_api_key("X666_API_KEY")
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 
 def ensure_api_key_present() -> None:
