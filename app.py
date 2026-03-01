@@ -8,9 +8,10 @@ Streamlit 前端：负责输入、状态提示、历史记录与结果展示。
 """
 from __future__ import annotations
 
+import html
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -38,7 +39,7 @@ from db.database import (
     update_task_status,
     update_transcription_progress,
 )
-from utils.copy_button import create_task_copy_button
+from utils.copy_button import create_copy_button_with_tooltip, create_task_copy_button
 from utils.file_helper import ensure_dir
 
 STATUS_MAP = {
@@ -58,7 +59,11 @@ SUMMARY_MODEL_OPTIONS = [
 
 
 def main() -> None:
-    st.set_page_config(page_title="B站音频转写助手", layout="wide")
+    st.set_page_config(
+        page_title="B站音频转写助手",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     try:
         ensure_api_key_present()
     except Exception as exc:  # noqa: BLE001
@@ -73,10 +78,15 @@ def main() -> None:
     if "running_task_id" not in st.session_state:
         st.session_state.running_task_id = None
 
-    st.title("Bilibili Video Transcription and Summary")
-    st.caption("输入 B 站链接，一键完成下载、转写、总结。")
+    title_col, tools_col = st.columns([6, 2], vertical_alignment="top")
+    with title_col:
+        st.title("Bilibili Video Transcription and Summary")
+        st.caption("输入 B 站链接，一键完成下载、转写、总结。")
+    with tools_col:
+        _render_top_actions()
 
-    _render_copy_address()
+    is_processing = st.session_state.running_task_id is not None
+    _inject_start_button_loading_style(is_processing)
 
     col_input, col_action = st.columns([4, 1], vertical_alignment="bottom")
     with col_input:
@@ -86,33 +96,34 @@ def main() -> None:
         )
     with col_action:
         run_btn = st.button(
-            "开始处理",
+            "处理中..." if is_processing else "开始处理",
             type="primary",
             use_container_width=True,
-            disabled=not user_input or st.session_state.running_task_id is not None,
+            key="start_process_btn",
+            disabled=not user_input or is_processing,
         )
 
     if run_btn and user_input:
         if not st.session_state.db_initialized and not _probe_database_ready():
-            st.error("数据库尚未初始化。请在左侧“设置与清理 -> 数据库维护”中手动初始化。")
+            st.error("数据库尚未初始化。请在右上角“⚙️ -> 数据库维护”中手动初始化。")
+            st.toast("❌ 数据库尚未初始化")
         else:
             # 提取并清洗 URL
             url = process_user_input(user_input)
             if not url:
                 st.error("无法识别有效的 B 站链接，请检查输入格式")
+                st.toast("❌ 链接解析失败，请检查输入")
             else:
                 st.session_state.running_task_id = _start_task(url, _get_active_prompt())
 
     if st.session_state.running_task_id is not None:
-        _render_running_task(st.session_state.running_task_id)
+        processing_hint = _render_running_task(st.session_state.running_task_id)
+        if processing_hint:
+            st.caption(f"⏳ {processing_hint}")
 
     st.divider()
-
-    settings_col, history_col = st.columns([1.2, 2])
-    with settings_col:
-        _render_settings()
-    with history_col:
-        _render_history()
+    requested_task_id = _consume_task_id_query_param()
+    _render_history(default_task_id=requested_task_id)
 
 
 def _start_task(url: str, system_prompt: Optional[str]) -> int:
@@ -189,16 +200,15 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
         _mark_task_failed_safely(task_id, str(exc))
 
 
-def _render_running_task(task_id: int) -> None:
+def _render_running_task(task_id: int) -> Optional[str]:
     try:
         task = get_task(task_id)
     except Exception:  # noqa: BLE001
-        st.info(f"正在处理任务 #{task_id}，请稍候...")
-        return
+        return f"正在处理任务 #{task_id}，请稍候..."
 
     if not task:
         st.session_state.running_task_id = None
-        return
+        return None
 
     active_statuses = {
         TaskStatus.WAITING.value,
@@ -206,13 +216,21 @@ def _render_running_task(task_id: int) -> None:
         TaskStatus.TRANSCRIBING.value,
         TaskStatus.SUMMARIZING.value,
     }
+    step_hint_map = {
+        TaskStatus.WAITING.value: "任务已提交，等待处理队列...",
+        TaskStatus.DOWNLOADING.value: "正在提取音频...",
+        TaskStatus.TRANSCRIBING.value: "正在进行语音转录...",
+        TaskStatus.SUMMARIZING.value: "正在调用大模型总结...",
+    }
     if task.status in active_statuses:
-        st.info(f"正在处理任务 #{task_id}（{STATUS_MAP.get(task.status, task.status)}），请稍候...")
-    else:
-        st.session_state.running_task_id = None
+        return step_hint_map.get(task.status, "任务处理中...")
+
+    st.session_state.running_task_id = None
+    _notify_task_result(task)
+    return None
 
 
-def _render_history() -> None:
+def _render_history(default_task_id: Optional[int] = None) -> None:
     st.subheader("历史记录")
     try:
         tasks = list_tasks(limit=50, include_content=False)
@@ -226,9 +244,14 @@ def _render_history() -> None:
         return
 
     options = {t.id: f"#{t.id} | {STATUS_MAP.get(t.status, t.status)} | {t.video_title or '未命名'}" for t in tasks}
+    task_ids = list(options.keys())
+    default_index = 0
+    if default_task_id in options:
+        default_index = task_ids.index(default_task_id)
     selected_id = st.selectbox(
         "选择任务查看详情",
-        options=list(options.keys()),
+        options=task_ids,
+        index=default_index,
         format_func=lambda tid: options.get(tid, str(tid)),
     )
     try:
@@ -245,42 +268,58 @@ def _render_history() -> None:
         if st.button("重新获取标题", use_container_width=True, type="secondary"):
             _refresh_title(task.id, task.bilibili_url)
 
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**转录文本**")
-        st.text_area("transcript", value=task.transcript_text or "", height=400, label_visibility="collapsed")
-        if task.transcript_text:
-            st.download_button(
-                label="下载逐字稿 (.txt)",
-                data=task.transcript_text,
-                file_name=f"task_{task.id}_transcript.txt",
-                mime="text/plain",
-                type="primary",
-                use_container_width=True,
-                key=f"download_transcript_{task.id}",
-            )
-            # 使用工具函数生成复制按钮
-            copy_button_html = create_task_copy_button(task.id, task.transcript_text)
-            components.html(copy_button_html, height=90, scrolling=False)
-    with right:
-        st.markdown("**总结结果**")
-        st.text_area("summary", value=task.summary_text or "", height=400, label_visibility="collapsed")
+    _inject_reading_experience_styles()
+    summary_tab, transcript_tab = st.tabs(["核心总结", "完整转录"])
+
+    with summary_tab:
+        summary_header_col, summary_action_col = st.columns([5, 1], vertical_alignment="bottom")
+        with summary_header_col:
+            st.markdown("#### 核心总结")
+        with summary_action_col:
+            if task.summary_text:
+                st.download_button(
+                    label="下载 MD",
+                    data=task.summary_text,
+                    file_name=f"task_{task.id}_summary.md",
+                    mime="text/markdown",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"download_summary_{task.id}",
+                )
+
         if task.summary_text:
-            st.download_button(
-                label="下载总结 (.md)",
-                data=task.summary_text,
-                file_name=f"task_{task.id}_summary.md",
-                mime="text/markdown",
-                type="primary",
-                use_container_width=True,
-                key=f"download_summary_{task.id}",
-            )
+            st.markdown(task.summary_text)
             summary_copy_button_html = create_task_copy_button(
                 task_id=task.id,
                 text_to_copy=task.summary_text,
                 button_text="复制总结",
             )
             components.html(summary_copy_button_html, height=90, scrolling=False)
+        else:
+            st.info("暂无总结内容。")
+
+    with transcript_tab:
+        transcript_header_col, transcript_action_col = st.columns([5, 1], vertical_alignment="bottom")
+        with transcript_header_col:
+            st.markdown("#### 完整转录")
+        with transcript_action_col:
+            if task.transcript_text:
+                st.download_button(
+                    label="下载 TXT",
+                    data=task.transcript_text,
+                    file_name=f"task_{task.id}_transcript.txt",
+                    mime="text/plain",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"download_transcript_{task.id}",
+                )
+
+        if task.transcript_text:
+            _render_transcript_reader(task.transcript_text)
+            transcript_copy_button_html = create_task_copy_button(task.id, task.transcript_text)
+            components.html(transcript_copy_button_html, height=90, scrolling=False)
+        else:
+            st.info("暂无转录文本。")
 
     st.caption(
         f"任务状态：{STATUS_MAP.get(task.status, task.status)}，"
@@ -308,8 +347,116 @@ def _render_history() -> None:
         _render_regen_dialog(task)
 
 
-def _render_settings() -> None:
-    st.subheader("设置与清理")
+def _render_top_actions() -> None:
+    nav_col, help_col, settings_col = st.columns([3, 1, 1], gap="small")
+    with nav_col:
+        if st.button("🗂️ 历史记录", use_container_width=True, key="go_history_page"):
+            st.switch_page("pages/history.py")
+    with help_col:
+        with st.popover("?", use_container_width=True):
+            st.markdown("**局域网访问地址**")
+            _render_copy_address()
+    with settings_col:
+        with st.popover("⚙️", use_container_width=True):
+            _render_settings(show_title=False)
+
+
+def _inject_start_button_loading_style(is_loading: bool) -> None:
+    loading_style = ""
+    if is_loading:
+        loading_style = """
+        .st-key-start_process_btn button[kind="primary"]::after {
+            content: "";
+            display: inline-block;
+            width: 0.85rem;
+            height: 0.85rem;
+            margin-left: 0.5rem;
+            border: 2px solid rgba(255, 255, 255, 0.45);
+            border-top-color: #ffffff;
+            border-radius: 50%;
+            vertical-align: middle;
+            animation: start-btn-spin 0.75s linear infinite;
+        }
+        """
+
+    st.markdown(
+        f"""
+        <style>
+        @keyframes start-btn-spin {{
+            to {{
+                transform: rotate(360deg);
+            }}
+        }}
+        {loading_style}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _notify_task_result(task: Task) -> None:
+    toast_key = f"task_result_toast_{task.id}_{task.status}"
+    if st.session_state.get(toast_key):
+        return
+
+    if task.status == TaskStatus.COMPLETED.value:
+        st.toast("✅ 总结完成")
+    elif task.status == TaskStatus.FAILED.value:
+        st.toast("❌ 任务失败，请查看详情")
+    else:
+        return
+    st.session_state[toast_key] = True
+
+
+def _inject_reading_experience_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .transcript-reader {
+            max-height: 560px;
+            overflow-y: auto;
+            border: 1px solid rgba(128, 128, 128, 0.35);
+            border-radius: 12px;
+            padding: 1rem 1.1rem;
+            background: rgba(250, 250, 250, 0.45);
+            scrollbar-width: thin;
+            scrollbar-color: #b7bdcc transparent;
+        }
+        .transcript-reader pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 1rem;
+            line-height: 1.6;
+            font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+        }
+        .transcript-reader::-webkit-scrollbar {
+            width: 10px;
+        }
+        .transcript-reader::-webkit-scrollbar-thumb {
+            background: #b7bdcc;
+            border-radius: 999px;
+        }
+        .transcript-reader::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_transcript_reader(transcript_text: str) -> None:
+    safe_text = html.escape(transcript_text)
+    st.markdown(
+        f'<div class="transcript-reader"><pre>{safe_text}</pre></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_settings(show_title: bool = True) -> None:
+    if show_title:
+        st.subheader("设置与清理")
     with st.expander("数据库维护", expanded=False):
         auto_init_text = "开启" if DB_AUTO_INIT_ON_STARTUP else "关闭"
         st.caption(f"启动时自动初始化：{auto_init_text}（环境变量：DB_AUTO_INIT_ON_STARTUP）")
@@ -452,6 +599,32 @@ def _get_active_prompt() -> Optional[str]:
     return prompt if prompt else None
 
 
+def _consume_task_id_query_param() -> Optional[int]:
+    """读取 URL 中的 task_id 参数并转换为整数，读取后清理参数避免重复生效。"""
+    raw_value: Any = st.query_params.get("task_id")
+    if raw_value is None:
+        return None
+
+    if isinstance(raw_value, list):
+        raw_value = raw_value[0] if raw_value else None
+    if raw_value is None:
+        return None
+
+    try:
+        task_id = int(str(raw_value))
+    except (TypeError, ValueError):
+        task_id = None
+
+    try:
+        del st.query_params["task_id"]
+    except Exception:  # noqa: BLE001
+        pass
+
+    if task_id is None or task_id <= 0:
+        return None
+    return task_id
+
+
 def _format_duration(seconds: Optional[int]) -> str:
     if not seconds:
         return "-"
@@ -581,15 +754,25 @@ def _retry_transcription(task: Task) -> None:
 def _render_copy_address() -> None:
     addrs = get_lan_addresses()
     if not addrs:
+        st.caption("未检测到可用局域网地址。")
         return
     port = st.session_state.get("server_port", 8501)
     options = [f"http://{addr}:{port}" for addr in addrs]
-    with st.expander("局域网访问地址与提示", expanded=False):
-        selected = options[0]
-        if len(options) > 1:
-            selected = st.selectbox("可用局域网地址", options, label_visibility="collapsed")
-        st.code(selected, language="text")
-        st.caption("手机需与本机同一局域网；如无法访问，请检查防火墙/端口。")
+    selected = options[0]
+    if len(options) > 1:
+        selected = st.selectbox("可用局域网地址", options, label_visibility="collapsed")
+    st.code(selected, language="text")
+    copy_button_html = create_copy_button_with_tooltip(
+        button_id=f"lan_address_{selected}",
+        text_to_copy=selected,
+        button_text="复制地址",
+        button_color="#2563eb",
+        button_hover_color="#1d4ed8",
+        success_message="✓ 局域网地址已复制",
+        error_message="✗ 复制地址失败",
+    )
+    components.html(copy_button_html, height=86, scrolling=False)
+    st.caption("手机需与本机同一局域网；如无法访问，请检查防火墙/端口。")
 
 
 _DEFAULT_PROMPT = """你是一个专业的长视频笔记助手，请将输入的完整转录文本，提炼为结构化笔记，需包含：

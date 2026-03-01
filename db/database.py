@@ -121,6 +121,16 @@ def _single_column_value(row: Any, key: str) -> Any:
     return row[key]
 
 
+def _build_like_pattern(keyword: str) -> str:
+    """构造 LIKE 模糊匹配模式，并转义特殊字符。"""
+    escaped_keyword = (
+        keyword.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"%{escaped_keyword}%"
+
+
 def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
     """
     初始化 SQLite 数据库，创建 tasks 表和必要索引。
@@ -321,6 +331,106 @@ def list_tasks(
     if isinstance(limit, int) and limit > 0:
         sql += " LIMIT ?"
         params = (limit,)
+
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(sql, params)
+        rows = cursor.fetchall()
+        return [Task.from_row(row) for row in rows]
+
+
+def count_tasks(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    title_keyword: Optional[str] = None,
+) -> int:
+    """
+    获取任务总数。
+
+    Args:
+        db_path: 数据库文件路径。
+        title_keyword: 标题模糊搜索关键词（可选）。
+
+    Returns:
+        当前任务总条数。
+    """
+    with get_connection(db_path) as connection:
+        if title_keyword and title_keyword.strip():
+            cursor = connection.execute(
+                "SELECT COUNT(1) AS total FROM tasks WHERE video_title LIKE ? ESCAPE '\\'",
+                (_build_like_pattern(title_keyword.strip()),),
+            )
+        else:
+            cursor = connection.execute("SELECT COUNT(1) AS total FROM tasks")
+        row = cursor.fetchone()
+        if not row:
+            return 0
+        return int(_single_column_value(row, "total") or 0)
+
+
+def list_tasks_paginated(
+    page: int,
+    page_size: int,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    include_content: bool = False,
+    title_keyword: Optional[str] = None,
+) -> List[Task]:
+    """
+    获取分页任务列表，按创建时间倒序排列。
+
+    Args:
+        page: 页码（从 1 开始）。
+        page_size: 每页条数。
+        db_path: 数据库文件路径。
+        include_content: 是否返回 transcript/summary 全文。
+        title_keyword: 标题模糊搜索关键词（可选）。
+
+    Returns:
+        当前页 Task 对象列表。
+    """
+    normalized_page = max(int(page), 1)
+    normalized_page_size = max(int(page_size), 1)
+    offset = (normalized_page - 1) * normalized_page_size
+    pattern: Optional[str] = None
+    if title_keyword and title_keyword.strip():
+        pattern = _build_like_pattern(title_keyword.strip())
+
+    if include_content and pattern is not None:
+        sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               transcript_text, summary_text, status, created_at
+        FROM tasks
+        WHERE video_title LIKE ? ESCAPE '\\'
+        ORDER BY datetime(created_at) DESC
+        LIMIT ? OFFSET ?
+        """
+        params: tuple[Any, ...] = (pattern, normalized_page_size, offset)
+    elif include_content:
+        sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               transcript_text, summary_text, status, created_at
+        FROM tasks
+        ORDER BY datetime(created_at) DESC
+        LIMIT ? OFFSET ?
+        """
+        params = (normalized_page_size, offset)
+    elif pattern is not None:
+        sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               NULL AS transcript_text, NULL AS summary_text, status, created_at
+        FROM tasks
+        WHERE video_title LIKE ? ESCAPE '\\'
+        ORDER BY datetime(created_at) DESC
+        LIMIT ? OFFSET ?
+        """
+        params = (pattern, normalized_page_size, offset)
+    else:
+        sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               NULL AS transcript_text, NULL AS summary_text, status, created_at
+        FROM tasks
+        ORDER BY datetime(created_at) DESC
+        LIMIT ? OFFSET ?
+        """
+        params = (normalized_page_size, offset)
 
     with get_connection(db_path) as connection:
         cursor = connection.execute(sql, params)
