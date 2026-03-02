@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import urllib.request
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -31,6 +32,17 @@ DEFAULT_DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / DOWNLOAD_DIR_NAM
 DEFAULT_COOKIE_FILE = Path("cookie.txt")
 
 INVALID_FILENAME_CHARS = r'[^a-zA-Z0-9\\-_\\.]'
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+SHORT_URL_DOMAIN = "b23.tv"
+DEFAULT_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.bilibili.com/",
+    "Origin": "https://www.bilibili.com",
+}
 
 
 @download_retry_decorator
@@ -62,33 +74,45 @@ def download_audio(
         RuntimeError: 下载或后处理失败时抛出异常。
     """
     target_dir = ensure_dir(download_dir)
+    normalized_url = _normalize_bilibili_url(url)
+    cookie_path = _resolve_cookie_file(cookie_file)
 
-    ydl_opts = _build_options(target_dir, cookie_file)
+    ydl_opts = _build_options(target_dir, cookie_path)
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(normalized_url, download=True)
             # yt-dlp 会在后处理阶段将扩展名替换为首选编解码格式
             raw_path = Path(ydl.prepare_filename(info))
             final_path = raw_path.with_suffix(f".{PREFERRED_CODEC}")
-            logger.info(f"音频下载成功: {final_path}")
+            logger.info("音频下载成功: %s", final_path)
             return (final_path, info) if return_info else final_path
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"音频下载失败: {exc}")
-        raise RuntimeError(f"音频下载失败：{exc}") from exc
+        clean_error = _sanitize_exception_message(str(exc))
+        logger.warning("音频下载失败: %s", clean_error)
+        raise RuntimeError(
+            _build_download_error_message(
+                error_text=clean_error,
+                has_cookie=bool(cookie_path),
+                source_url=normalized_url,
+            )
+        ) from exc
 
 
-def _build_options(download_dir: Path, cookie_file: Optional[Path | str]) -> dict:
+def _resolve_cookie_file(cookie_file: Optional[Path | str]) -> Optional[Path]:
+    """解析 cookie 文件路径，存在时返回绝对路径。"""
+    if cookie_file is None:
+        return None
+    candidate = Path(cookie_file).expanduser().resolve()
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _build_options(download_dir: Path, cookie_path: Optional[Path]) -> dict:
     """封装 yt-dlp 配置，确保只下载音频。"""
-    cookie_path: Optional[Path] = None
-    if cookie_file is not None:
-        candidate = Path(cookie_file).expanduser().resolve()
-        if candidate.is_file():
-            cookie_path = candidate
-
     outtmpl = str(download_dir / "%(title).80s_%(epoch)s.%(ext)s")
-
-    return {
+    options = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
@@ -105,11 +129,56 @@ def _build_options(download_dir: Path, cookie_file: Optional[Path | str]) -> dic
             }
         ],
         "trim_file_name": 240,
-        "cookiefile": str(cookie_path) if cookie_path else None,
         "cachedir": False,
         "outtmpl_na_placeholder": "unknown",
         "paths": {"home": str(download_dir)},
+        "http_headers": DEFAULT_HTTP_HEADERS,
     }
+    if cookie_path:
+        options["cookiefile"] = str(cookie_path)
+    return options
+
+
+def _normalize_bilibili_url(url: str) -> str:
+    """尽量将 b23.tv 短链解析为完整链接，失败则回退原地址。"""
+    if SHORT_URL_DOMAIN not in url.lower():
+        return url
+
+    request = urllib.request.Request(url, headers=DEFAULT_HTTP_HEADERS, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            redirected = response.geturl()
+        if redirected:
+            return redirected
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("短链解析失败，继续使用原链接: %s", exc)
+    return url
+
+
+def _sanitize_exception_message(message: str) -> str:
+    """移除 ANSI 控制符并压缩空白字符，避免错误信息污染页面。"""
+    cleaned = ANSI_ESCAPE_PATTERN.sub("", message)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _build_download_error_message(error_text: str, has_cookie: bool, source_url: str) -> str:
+    """构造可读且可操作的下载错误提示。"""
+    lowered_error = error_text.lower()
+    is_http_403 = "http error 403" in lowered_error or "403: forbidden" in lowered_error
+    if not is_http_403:
+        return f"音频下载失败：{error_text}"
+
+    hints = ["B站返回 HTTP 403，可能触发风控、访问频率限制或需要登录态。"]
+    if SHORT_URL_DOMAIN in source_url.lower():
+        hints.append("建议改用完整 BV 链接再试。")
+    if has_cookie:
+        hints.append("已检测到 cookie.txt，请确认 cookie 未过期且导出为 Netscape 格式。")
+    else:
+        hints.append("请在项目根目录放置有效的 cookie.txt 后重试。")
+    hints.append("若持续报错，请升级 yt-dlp 后重试。")
+
+    hint_text = " ".join(hints)
+    return f"音频下载失败（HTTP 403）：{hint_text} 原始错误：{error_text}"
 
 
 def sanitize_title(title: str) -> str:

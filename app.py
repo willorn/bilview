@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,6 +57,8 @@ SUMMARY_MODEL_OPTIONS = [
     ("gpt-5.2-high", "gpt-5.2-high"),
     ("gemini-3-flash-preview", "gemini-3-flash-preview"),
 ]
+REGEN_FEEDBACK_SESSION_KEY = "regen_feedback"
+REGEN_ACTION_DEBOUNCE_SECONDS = 1.2
 
 
 def main() -> None:
@@ -268,6 +271,8 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
         if st.button("重新获取标题", use_container_width=True, type="secondary"):
             _refresh_title(task.id, task.bilibili_url)
 
+    _render_regen_feedback(task.id)
+
     _inject_reading_experience_styles()
     summary_tab, transcript_tab = st.tabs(["核心总结", "完整转录"])
 
@@ -326,6 +331,8 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
         f"时长：{_format_duration(task.video_duration_seconds)}, "
         f"创建时间：{task.created_at}"
     )
+    if task.status == TaskStatus.FAILED.value:
+        st.warning("最近一次处理失败。若下方仍显示旧总结，说明本次重新生成未成功覆盖。")
 
     # 显示转写进度信息
     if task.status == TaskStatus.FAILED.value:
@@ -339,9 +346,12 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
 
     if task.status in {TaskStatus.SUMMARIZING.value, TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}:
         if st.button("重新生成总结", use_container_width=True, type="primary", key=f"regen_{task.id}"):
-            st.session_state["show_regen_dialog"] = True
-            st.session_state["regen_task_id"] = task.id
-            st.session_state.setdefault("regen_model_choice", SUMMARY_MODEL_OPTIONS[0][1])
+            if _allow_action(f"open_regen_dialog_{task.id}"):
+                st.session_state["show_regen_dialog"] = True
+                st.session_state["regen_task_id"] = task.id
+                st.session_state.setdefault("regen_model_choice", SUMMARY_MODEL_OPTIONS[0][1])
+            else:
+                st.toast("点击过快，请稍后再试")
 
     if st.session_state.get("show_regen_dialog") and st.session_state.get("regen_task_id") == task.id:
         _render_regen_dialog(task)
@@ -406,6 +416,55 @@ def _notify_task_result(task: Task) -> None:
     else:
         return
     st.session_state[toast_key] = True
+
+
+def _set_regen_feedback(task_id: int, level: str, message: str) -> None:
+    """记录重新生成总结后的提示信息，在下次渲染详情时展示。"""
+    st.session_state[REGEN_FEEDBACK_SESSION_KEY] = {
+        "task_id": task_id,
+        "level": level,
+        "message": message,
+    }
+
+
+def _allow_action(action_name: str, cooldown_seconds: float = REGEN_ACTION_DEBOUNCE_SECONDS) -> bool:
+    """简单防抖：限制同一动作在短时间内重复触发。"""
+    state_key = f"action_debounce::{action_name}"
+    now = time.monotonic()
+    previous = st.session_state.get(state_key, 0.0)
+    try:
+        last_ts = float(previous)
+    except (TypeError, ValueError):
+        last_ts = 0.0
+
+    if now - last_ts < cooldown_seconds:
+        return False
+    st.session_state[state_key] = now
+    return True
+
+
+def _render_regen_feedback(task_id: int) -> None:
+    """展示并消费一次性反馈，避免用户错过失败/成功提示。"""
+    payload: Any = st.session_state.get(REGEN_FEEDBACK_SESSION_KEY)
+    if not isinstance(payload, dict):
+        return
+    if payload.get("task_id") != task_id:
+        return
+
+    message = str(payload.get("message", "")).strip()
+    level = str(payload.get("level", "info"))
+    if not message:
+        st.session_state.pop(REGEN_FEEDBACK_SESSION_KEY, None)
+        return
+
+    if level == "success":
+        st.success(message)
+    elif level == "error":
+        st.error(message)
+    else:
+        st.info(message)
+
+    st.session_state.pop(REGEN_FEEDBACK_SESSION_KEY, None)
 
 
 def _inject_reading_experience_styles() -> None:
@@ -522,7 +581,10 @@ def _render_regen_dialog(task: Task) -> None:
         col_confirm, col_cancel = st.columns(2)
         with col_confirm:
             if st.button("开始生成", type="primary", use_container_width=True, key=f"confirm_regen_{task.id}"):
-                _regenerate_summary(task, model=selected_model)
+                if _allow_action(f"confirm_regen_{task.id}"):
+                    _regenerate_summary(task, model=selected_model)
+                else:
+                    st.info("点击过快，请稍后再试。")
         with col_cancel:
             if st.button("取消", use_container_width=True, key=f"cancel_regen_{task.id}"):
                 st.session_state["show_regen_dialog"] = False
@@ -657,7 +719,10 @@ def _refresh_title(task_id: int, url: str) -> None:
 def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
     """使用已存转录重新生成总结，可指定模型。"""
     if not task.transcript_text:
-        st.error("暂无转录文本，无法生成总结")
+        _set_regen_feedback(task.id, "error", "暂无转录文本，无法生成总结")
+        st.session_state["show_regen_dialog"] = False
+        st.session_state["regen_task_id"] = None
+        st.rerun()
         return
     chosen_model = model or st.session_state.get("regen_model_choice") or DEFAULT_LLM_MODEL
     try:
@@ -667,15 +732,26 @@ def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
             system_prompt=_get_active_prompt(),
             model=chosen_model,
         )
+        if not summary.strip():
+            raise RuntimeError("模型未返回有效总结内容，请切换模型后重试。")
         update_task_content(task.id, summary_text=summary)
         update_task_status(task.id, TaskStatus.COMPLETED.value)
-        st.success("总结已重新生成")
+        _set_regen_feedback(task.id, "success", "总结已重新生成")
     except Exception as exc:  # noqa: BLE001
-        update_task_status(task.id, TaskStatus.FAILED.value)
-        st.error(f"重新生成失败：{exc}")
+        try:
+            update_task_status(task.id, TaskStatus.FAILED.value)
+        except Exception:  # noqa: BLE001
+            pass
+        if not (task.summary_text and task.summary_text.strip()):
+            try:
+                update_task_content(task.id, summary_text=f"[系统] 重新生成失败：{exc}")
+            except Exception:  # noqa: BLE001
+                pass
+        _set_regen_feedback(task.id, "error", f"重新生成失败：{exc}")
     finally:
         st.session_state["show_regen_dialog"] = False
         st.session_state["regen_task_id"] = None
+    st.rerun()
 
 
 def _retry_transcription(task: Task) -> None:
