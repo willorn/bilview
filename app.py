@@ -22,7 +22,7 @@ from utils.network import get_lan_addresses
 from utils.url_helper import process_user_input
 from config import DB_AUTO_INIT_ON_STARTUP, DEFAULT_LLM_MODEL, DOWNLOAD_DIR, ensure_api_key_present
 from core.downloader import download_audio
-from core.summarizer import generate_summary, get_default_system_prompt
+from core import summarizer as summarizer_module
 from core.transcriber import audio_to_text
 from db.database import (
     DEFAULT_DB_PATH,
@@ -60,7 +60,20 @@ SUMMARY_MODEL_OPTIONS = [
 REGEN_FEEDBACK_SESSION_KEY = "regen_feedback"
 REGEN_ACTION_DEBOUNCE_SECONDS = 1.2
 TRANSCRIBE_MODEL_SIZE = "medium"
-_DEFAULT_PROMPT = get_default_system_prompt()
+
+
+def _load_default_prompt() -> str:
+    getter = getattr(summarizer_module, "get_default_system_prompt", None)
+    if callable(getter):
+        return getter()
+    try:
+        prompt_path = Path(__file__).resolve().parent / "docs" / "default_prompt.md"
+        return prompt_path.read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_DEFAULT_PROMPT = _load_default_prompt()
 
 
 def main() -> None:
@@ -191,7 +204,7 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
         update_task_content(task_id, transcript_text=transcript)
 
         update_task_status(task_id, TaskStatus.SUMMARIZING.value)
-        summary = generate_summary(transcript, system_prompt=system_prompt)
+        summary = summarizer_module.generate_summary(transcript, system_prompt=system_prompt)
         update_task_content(task_id, summary_text=summary)
 
         update_task_status(task_id, TaskStatus.COMPLETED.value)
@@ -729,7 +742,7 @@ def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
     chosen_model = model or st.session_state.get("regen_model_choice") or DEFAULT_LLM_MODEL
     try:
         update_task_status(task.id, TaskStatus.SUMMARIZING.value)
-        summary = generate_summary(
+        summary = summarizer_module.generate_summary(
             task.transcript_text,
             system_prompt=_get_active_prompt(),
             model=chosen_model,
@@ -811,7 +824,7 @@ def _retry_transcription(task: Task) -> None:
             # 继续总结
             update_task_status(task.id, TaskStatus.SUMMARIZING.value)
             status_box.write("总结中（LLM）...")
-            summary = generate_summary(transcript, system_prompt=_get_active_prompt())
+            summary = summarizer_module.generate_summary(transcript, system_prompt=_get_active_prompt())
             update_task_content(task.id, summary_text=summary)
 
             update_task_status(task.id, TaskStatus.COMPLETED.value)

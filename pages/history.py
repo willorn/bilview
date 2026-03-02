@@ -233,7 +233,7 @@ def _build_task_row_html(task: Task) -> str:
 
     detail_link = html.escape(f"/?task_id={task.id}", quote=True)
     delete_link = html.escape(f"?confirm_delete={task.id}", quote=True)
-    cancel_link = html.escape("?", quote=True)
+    confirm_text = html.escape("确定要删除这条记录吗？", quote=True)
 
     row_html = dedent(
         f"""
@@ -245,16 +245,12 @@ def _build_task_row_html(task: Task) -> str:
           <td class="action-col">
             <div class="action-group">
               <a class="action-link" href="{detail_link}" target="_self">查看详情</a>
-              <details class="delete-popconfirm">
-                <summary class="delete-trigger">删除</summary>
-                <div class="delete-bubble">
-                  <div class="delete-text">确定要删除这条记录吗？</div>
-                  <div class="delete-actions">
-                    <a class="delete-confirm" href="{delete_link}" target="_self">确定</a>
-                    <a class="delete-cancel" href="{cancel_link}" target="_self">取消</a>
-                  </div>
-                </div>
-              </details>
+              <a
+                class="action-link delete-link"
+                href="{delete_link}"
+                target="_self"
+                onclick="event.stopPropagation(); return window.confirm('{confirm_text}');"
+              >删除</a>
             </div>
           </td>
         </tr>
@@ -438,6 +434,9 @@ def _inject_table_styles() -> None:
             color: #2563eb;
             text-decoration: none;
             font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            line-height: 1.25;
         }
         .history-table .action-link:hover {
             text-decoration: underline;
@@ -449,67 +448,8 @@ def _inject_table_styles() -> None:
             justify-content: flex-end;
             width: 100%;
         }
-        .history-table .delete-popconfirm {
-            position: relative;
-            display: inline-flex;
-        }
-        .history-table .delete-popconfirm > summary {
-            list-style: none;
-        }
-        .history-table .delete-popconfirm > summary::-webkit-details-marker {
-            display: none;
-        }
-        .history-table .delete-trigger {
+        .history-table .delete-link {
             color: #dc2626;
-            cursor: pointer;
-            font-weight: 600;
-            user-select: none;
-        }
-        .history-table .delete-trigger:hover {
-            text-decoration: underline;
-        }
-        .history-table .delete-bubble {
-            position: absolute;
-            right: 0;
-            top: calc(100% + 8px);
-            min-width: 220px;
-            padding: 10px 12px;
-            border-radius: 10px;
-            border: 1px solid #fed7d7;
-            background: #fff5f5;
-            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.14);
-            z-index: 30;
-        }
-        .history-table .delete-text {
-            font-size: 0.82rem;
-            color: #7f1d1d;
-            margin-bottom: 8px;
-            text-align: left;
-        }
-        .history-table .delete-actions {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            justify-content: flex-end;
-        }
-        .history-table .delete-confirm,
-        .history-table .delete-cancel {
-            text-decoration: none;
-            font-size: 0.80rem;
-            border-radius: 999px;
-            padding: 2px 10px;
-            border: 1px solid transparent;
-            font-weight: 600;
-        }
-        .history-table .delete-confirm {
-            color: #ffffff;
-            background: #dc2626;
-            border-color: #dc2626;
-        }
-        .history-table .delete-cancel {
-            color: #b91c1c;
-            background: #fee2e2;
-            border-color: #fecaca;
         }
         </style>
         """,
