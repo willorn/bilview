@@ -12,22 +12,15 @@ import html
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import streamlit as st
 import streamlit.components.v1 as components
 from yt_dlp import YoutubeDL
 
+import config as app_config
 from utils.network import get_lan_addresses
 from utils.url_helper import process_user_input
-from config import (
-    DB_AUTO_INIT_ON_STARTUP,
-    DEFAULT_ASR_PROVIDER,
-    DEFAULT_GROQ_ASR_MODEL,
-    DEFAULT_LLM_MODEL,
-    DOWNLOAD_DIR,
-    ensure_api_key_present,
-)
 from core.downloader import download_audio
 from core import summarizer as summarizer_module
 from core.transcriber import audio_to_text
@@ -52,6 +45,32 @@ from db.database import (
 )
 from utils.copy_button import create_copy_button_with_tooltip, create_task_copy_button
 from utils.file_helper import ensure_dir
+
+DB_AUTO_INIT_ON_STARTUP = bool(getattr(app_config, "DB_AUTO_INIT_ON_STARTUP", False))
+DEFAULT_ASR_PROVIDER = (
+    str(getattr(app_config, "DEFAULT_ASR_PROVIDER", "groq")).strip().lower()
+    or "groq"
+)
+DEFAULT_GROQ_ASR_MODEL = (
+    str(getattr(app_config, "DEFAULT_GROQ_ASR_MODEL", "whisper-large-v3-turbo")).strip()
+    or "whisper-large-v3-turbo"
+)
+DEFAULT_LLM_MODEL = (
+    str(getattr(app_config, "DEFAULT_LLM_MODEL", "gemini-2.5-pro-1m")).strip()
+    or "gemini-2.5-pro-1m"
+)
+_download_dir_value = getattr(app_config, "DOWNLOAD_DIR", Path("downloads")) or Path("downloads")
+DOWNLOAD_DIR = Path(_download_dir_value).expanduser().resolve()
+_config_ensure_api_key = getattr(app_config, "ensure_api_key_present", None)
+
+
+def _noop_ensure_api_key_present() -> None:
+    return None
+
+
+ensure_api_key_present: Callable[[], None] = (
+    _config_ensure_api_key if callable(_config_ensure_api_key) else _noop_ensure_api_key
+)
 
 STATUS_MAP = {
     TaskStatus.WAITING.value: "等待中",

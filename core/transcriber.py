@@ -18,12 +18,18 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from pydub import AudioSegment
 
-from config import DEFAULT_ASR_PROVIDER, DEFAULT_GROQ_ASR_MODEL
+import config as app_config
 from core.speech_recognition import create_speech_recognizer
 
 DEFAULT_MODEL_SIZE = "base"
-DEFAULT_PROVIDER = DEFAULT_ASR_PROVIDER
-DEFAULT_ASR_MODEL = DEFAULT_GROQ_ASR_MODEL
+DEFAULT_PROVIDER = (
+    str(getattr(app_config, "DEFAULT_ASR_PROVIDER", "groq")).strip().lower()
+    or "groq"
+)
+DEFAULT_ASR_MODEL = (
+    str(getattr(app_config, "DEFAULT_GROQ_ASR_MODEL", "whisper-large-v3-turbo")).strip()
+    or "whisper-large-v3-turbo"
+)
 CHUNK_DURATION_SECONDS = 300  # 每段 5 分钟，兼顾稳定性与性能
 FILE_SIZE_LIMIT_MB = 25
 GROQ_PROVIDER = "groq"

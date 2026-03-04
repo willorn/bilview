@@ -22,15 +22,52 @@ from openai import OpenAI
 import torch
 import whisper
 
-from config import (
-    ASR_REQUEST_TIMEOUT_SECONDS,
-    DEFAULT_ASR_PROVIDER,
-    DEFAULT_GROQ_ASR_BASE_URL,
-    DEFAULT_GROQ_ASR_MODEL,
-    GROQ_API_KEYS,
-)
+import config as app_config
 
 logger = logging.getLogger(__name__)
+
+
+def _get_config_int(name: str, default: int) -> int:
+    raw_value = getattr(app_config, name, default)
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_config_str(name: str, default: str, *, to_lower: bool = False) -> str:
+    raw_value = getattr(app_config, name, default)
+    normalized = str(raw_value).strip() if raw_value is not None else ""
+    if to_lower:
+        normalized = normalized.lower()
+    return normalized or default
+
+
+def _get_config_keys(name: str) -> List[str]:
+    raw_value = getattr(app_config, name, [])
+    if isinstance(raw_value, str):
+        normalized = raw_value.replace("\n", ",")
+        return [item.strip() for item in normalized.split(",") if item.strip()]
+    if isinstance(raw_value, Sequence):
+        return [
+            normalized
+            for normalized in (str(item).strip() for item in raw_value)
+            if normalized
+        ]
+    return []
+
+
+ASR_REQUEST_TIMEOUT_SECONDS = _get_config_int("ASR_REQUEST_TIMEOUT_SECONDS", 120)
+DEFAULT_ASR_PROVIDER = _get_config_str("DEFAULT_ASR_PROVIDER", "groq", to_lower=True)
+DEFAULT_GROQ_ASR_BASE_URL = _get_config_str(
+    "DEFAULT_GROQ_ASR_BASE_URL",
+    "https://api.groq.com/openai/v1",
+)
+DEFAULT_GROQ_ASR_MODEL = _get_config_str(
+    "DEFAULT_GROQ_ASR_MODEL",
+    "whisper-large-v3-turbo",
+)
+GROQ_API_KEYS = _get_config_keys("GROQ_API_KEYS")
 
 # 规避 Streamlit 文件监控在检查 torch.classes.__path__ 时触发的 RuntimeError
 try:
