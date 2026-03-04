@@ -50,12 +50,18 @@ def create_download_button(
     hover_decoration = "underline"
 
     return f"""
-    <div style="width: 100%;">
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+      }}
+    </style>
+    <div style="display: inline-block; width: fit-content;">
       <button
         id="downloadBtn_{button_id}"
         onclick="downloadFile_{button_id}()"
         style="
-          width: 100%;
+          width: auto;
           padding: {padding_y} 0.5rem;
           background-color: {bg_color};
           color: {text_color};
@@ -64,6 +70,7 @@ def create_download_button(
           cursor: pointer;
           font-size: {font_size};
           font-weight: {font_weight};
+          white-space: nowrap;
           text-decoration: {text_decoration};
           transition: all 0.2s;
         "

@@ -367,7 +367,7 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
             summary_text = _get_cached_task_text(task.id, "summary") or ""
 
         # 标题栏和操作按钮：标题左侧，按钮靠右
-        header_col, action_col = st.columns([1, 0.28], vertical_alignment="center")
+        header_col, action_col = st.columns([1, 0.18], vertical_alignment="center")
         with header_col:
             st.markdown("#### 核心总结")
         with action_col:
@@ -441,7 +441,7 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
             raw_transcript_text = _get_cached_task_text(task.id, "raw_transcript") or ""
 
         # 标题栏和操作按钮：标题左侧，按钮靠右
-        header_col, action_col = st.columns([1, 0.28], vertical_alignment="center")
+        header_col, action_col = st.columns([1, 0.18], vertical_alignment="center")
         with header_col:
             st.markdown("#### 完整转录（阅读版）")
         with action_col:
@@ -596,34 +596,53 @@ def _render_action_buttons(
     mime: str = "text/plain",
     key_prefix: str = "action",
 ) -> None:
-    """渲染并排的复制和下载超链接样式按钮，靠右对齐，中间间隔5像素。"""
-    # 按钮列宽刚好容纳两个汉字，中间5像素间隔
-    copy_col, download_col = st.columns([0.12, 0.12], gap="small")
+    """渲染并排的复制和下载超链接样式按钮，靠右对齐，中间精确 5px 间隔。"""
+    copy_button_html = create_copy_button_with_tooltip(
+        button_id=f"{key_prefix}_{task_id}",
+        text_to_copy=text_content,
+        button_text=copy_label,
+        button_color="transparent",
+        button_hover_color="#f0f0f0",
+        success_message="✓ 已复制",
+        error_message="✗ 复制失败",
+    )
 
-    with copy_col:
-        copy_button_html = create_copy_button_with_tooltip(
-            button_id=f"{key_prefix}_{task_id}",
-            text_to_copy=text_content,
-            button_text=copy_label,
-            button_color="transparent",
-            button_hover_color="#f0f0f0",
-            success_message="✓ 已复制",
-            error_message="✗ 复制失败",
-        )
-        components.html(copy_button_html, height=36, scrolling=False)
+    from utils.download_button import create_download_button
 
-    with download_col:
-        from utils.download_button import create_download_button
-        download_button_html = create_download_button(
-            button_id=f"{key_prefix}_{task_id}",
-            content=text_content,
-            filename=download_filename,
-            label=download_label,
-            mime=mime,
-            button_color="transparent",
-            button_hover_color="#f0f0f0",
-        )
-        components.html(download_button_html, height=36, scrolling=False)
+    download_button_html = create_download_button(
+        button_id=f"{key_prefix}_{task_id}",
+        content=text_content,
+        filename=download_filename,
+        label=download_label,
+        mime=mime,
+        button_color="transparent",
+        button_hover_color="#f0f0f0",
+    )
+
+    action_row_html = f"""
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+      }}
+      .action-row {{
+        width: 100%;
+        display: flex;
+        justify-content: flex-end;
+        align-items: flex-start;
+        gap: 5px;
+        flex-wrap: wrap;
+      }}
+      .action-item {{
+        flex: 0 0 auto;
+      }}
+    </style>
+    <div class="action-row">
+      <div class="action-item">{copy_button_html}</div>
+      <div class="action-item">{download_button_html}</div>
+    </div>
+    """
+    components.html(action_row_html, height=40, scrolling=False)
 
 
 def _allow_action(action_name: str, cooldown_seconds: float = REGEN_ACTION_DEBOUNCE_SECONDS) -> bool:

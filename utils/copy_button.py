@@ -67,12 +67,18 @@ def create_copy_button_with_tooltip(
     hover_decoration = "underline"
 
     markup = f"""
-    <div style="width: 100%; position: relative; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+    <style>
+    html, body {{
+        margin: 0;
+        padding: 0;
+    }}
+    </style>
+    <div style="display: inline-block; width: fit-content; position: relative; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
         <button
             onclick="copyToClipboard_{safe_id}()"
             id="copyBtn_{safe_id}"
             style="
-                width: 100%;
+                width: auto;
                 padding: {padding_y} 0.5rem;
                 background-color: {bg_color};
                 color: {text_color};
@@ -81,6 +87,7 @@ def create_copy_button_with_tooltip(
                 cursor: pointer;
                 font-size: {font_size};
                 font-weight: 500;
+                white-space: nowrap;
                 text-decoration: {text_decoration};
                 transition: all 0.2s;
             "
@@ -91,16 +98,20 @@ def create_copy_button_with_tooltip(
         <div
             id="tooltip_{safe_id}"
             style="
-                margin-top: 0.4rem;
+                position: absolute;
+                bottom: calc(100% + 0.35rem);
+                left: 50%;
+                transform: translateX(-50%);
                 background-color: #262730;
                 color: white;
                 padding: 0.35rem 0.65rem;
                 border-radius: 0.375rem;
                 font-size: 0.8rem;
+                white-space: nowrap;
                 opacity: 0;
                 pointer-events: none;
                 transition: opacity 0.3s;
-                display: inline-block;
+                display: block;
                 z-index: 1000;
             "></div>
     </div>
@@ -109,7 +120,86 @@ def create_copy_button_with_tooltip(
         const text = {escaped_text};
         const tooltip = document.getElementById('tooltip_{safe_id}');
         const button = document.getElementById('copyBtn_{safe_id}');
-        const originalText = button.textContent;
+
+        function getToastHostDocument() {{
+            try {{
+                if (window.parent && window.parent.document) {{
+                    return window.parent.document;
+                }}
+            }} catch (e) {{
+                // 访问父窗口受限时降级到当前 iframe 文档
+            }}
+            return document;
+        }}
+
+        function showGlobalToast(message, color, duration) {{
+            const hostDoc = getToastHostDocument();
+            const styleId = 'global_copy_toast_style';
+            const containerId = 'global_copy_toast_container';
+
+            if (!hostDoc.getElementById(styleId)) {{
+                const styleEl = hostDoc.createElement('style');
+                styleEl.id = styleId;
+                styleEl.textContent = `
+                    #${{containerId}} {{
+                        position: fixed;
+                        top: 18px;
+                        left: 50%;
+                        transform: translateX(-50%);
+                        z-index: 2147483000;
+                        pointer-events: none;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        gap: 8px;
+                    }}
+                    #${{containerId}} .global-copy-toast-item {{
+                        color: #fff;
+                        padding: 0.5rem 0.85rem;
+                        border-radius: 999px;
+                        font-size: 0.85rem;
+                        font-weight: 600;
+                        line-height: 1.1;
+                        white-space: nowrap;
+                        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
+                        opacity: 0;
+                        transform: translateY(-6px);
+                        transition: opacity 0.18s ease, transform 0.18s ease;
+                    }}
+                    #${{containerId}} .global-copy-toast-item.show {{
+                        opacity: 1;
+                        transform: translateY(0);
+                    }}
+                `;
+                hostDoc.head.appendChild(styleEl);
+            }}
+
+            let container = hostDoc.getElementById(containerId);
+            if (!container) {{
+                container = hostDoc.createElement('div');
+                container.id = containerId;
+                hostDoc.body.appendChild(container);
+            }}
+
+            const toast = hostDoc.createElement('div');
+            toast.className = 'global-copy-toast-item';
+            toast.textContent = message;
+            toast.style.backgroundColor = color;
+            container.appendChild(toast);
+
+            requestAnimationFrame(function() {{
+                toast.classList.add('show');
+            }});
+
+            setTimeout(function() {{
+                toast.classList.remove('show');
+                setTimeout(function() {{
+                    if (toast.parentNode) {{
+                        toast.parentNode.removeChild(toast);
+                    }}
+                }}, 220);
+            }}, duration);
+        }}
 
         function showTooltip(message, color, duration) {{
             tooltip.textContent = message;
@@ -140,19 +230,25 @@ def create_copy_button_with_tooltip(
                 }}
             }}
 
-            button.textContent = '✓ 已复制';
             button.style.color = '#0e7c3a';
             button.style.backgroundColor = 'transparent';
-            showTooltip({escaped_success_message}, '#0e7c3a', {success_duration});
+            try {{
+                showGlobalToast({escaped_success_message}, '#0e7c3a', {success_duration});
+            }} catch (toastError) {{
+                showTooltip({escaped_success_message}, '#0e7c3a', {success_duration});
+            }}
 
             setTimeout(function() {{
-                button.textContent = originalText;
                 button.style.color = '{text_color}';
                 button.style.backgroundColor = '{bg_color}';
             }}, {success_duration});
         }} catch (err) {{
             console.error('复制失败:', err);
-            showTooltip({escaped_error_message}, '#dc2626', {error_duration});
+            try {{
+                showGlobalToast({escaped_error_message}, '#dc2626', {error_duration});
+            }} catch (toastError) {{
+                showTooltip({escaped_error_message}, '#dc2626', {error_duration});
+            }}
         }}
     }}
     </script>
