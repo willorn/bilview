@@ -57,6 +57,9 @@ def get_api_key(env_name: str, default: Optional[str] = None) -> Optional[str]:
 X666_API_KEY = get_api_key("X666_API_KEY")
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_D1_DATABASE_ID = os.getenv("CLOUDFLARE_D1_DATABASE_ID")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 DB_AUTO_INIT_ON_STARTUP = _env_bool("DB_AUTO_INIT_ON_STARTUP", default=False)
 
 

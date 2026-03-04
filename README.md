@@ -52,6 +52,13 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
    TURSO_AUTH_TOKEN=你的turso-token
    ```
 
+   若使用 Cloudflare D1（会优先于 Turso）：
+   ```
+   CLOUDFLARE_ACCOUNT_ID=你的account_id
+   CLOUDFLARE_D1_DATABASE_ID=你的database_id
+   CLOUDFLARE_API_TOKEN=你的api_token
+   ```
+
 
 3) 启动前端  
    ```bash
@@ -73,7 +80,7 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
 
 ### 配置要点
 - Python 版本建议 3.10/3.12；若平台固定为 3.13，请确保 `audioop-lts` 已安装（requirements 已按条件依赖声明），或通过 `runtime.txt` 指定 3.12。
-- `.env`：`X666_API_KEY`（优先）；如配置 `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`，默认数据库会自动切到 Turso。  
+- `.env`：`X666_API_KEY`（优先）；若配置 Cloudflare D1 三元组（`CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_D1_DATABASE_ID`、`CLOUDFLARE_API_TOKEN`）将优先使用 D1；否则如配置 `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`，默认数据库会自动切到 Turso。  
 - 可选：`DB_AUTO_INIT_ON_STARTUP=1` 启动时自动执行数据库初始化（默认关闭，推荐在“设置与清理 -> 数据库维护”手动触发）。  
 - `config.py`：`DEFAULT_LLM_API_URL`、`DEFAULT_LLM_MODEL`、`DB_PATH`、`DOWNLOAD_DIR` 等集中管理。  
 - 状态枚举：DB 中存英文 (`waiting/downloading/...`)，UI 层通过 `STATUS_MAP` 映射中文。

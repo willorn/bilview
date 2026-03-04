@@ -12,13 +12,18 @@ import logging
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Sequence
 
 from config import (
+    CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_D1_DATABASE_ID,
     DB_PATH,
     TURSO_AUTH_TOKEN,
     TURSO_DATABASE_URL,
@@ -31,10 +36,12 @@ except ImportError:  # pragma: no cover - 由运行环境决定是否安装 libs
     libsql = None
 
 CONNECTION_TIMEOUT_SECONDS = 30
+HTTP_CONNECTION_TIMEOUT_SECONDS = 30
 DATA_DIR_NAME = "data"
 DB_FILE_NAME = "app.db"
 DEFAULT_DB_PATH = DB_PATH
 REMOTE_DB_SCHEMES = ("libsql://", "https://", "http://")
+D1_API_BASE_URL = "https://api.cloudflare.com/client/v4"
 TURSO_SYNC_INTERVAL_SECONDS = 15.0
 TURSO_SYNC_FAILURE_BACKOFF_SECONDS = 60.0
 TURSO_SYNC_FAILURE_LOG_INTERVAL_SECONDS = 30.0
@@ -42,6 +49,7 @@ _TURSO_SYNC_LOCK = threading.Lock()
 _LAST_TURSO_SYNC_MONOTONIC = 0.0
 _NEXT_TURSO_SYNC_RETRY_MONOTONIC = 0.0
 _LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC = 0.0
+_TURSO_CONNECTION_LOCAL = threading.local()
 LOGGER = logging.getLogger(__name__)
 _INIT_DB_LOCK = threading.Lock()
 _INITIALIZED_DB_TARGETS: set[str] = set()
@@ -103,6 +111,107 @@ class Task:
             status=row["status"],
             created_at=row["created_at"],
         )
+
+
+@dataclass(frozen=True)
+class D1Credentials:
+    """Cloudflare D1 连接所需凭据。"""
+
+    account_id: str
+    database_id: str
+    api_token: str
+
+
+class D1Cursor:
+    """模拟 sqlite 游标接口，适配现有调用逻辑。"""
+
+    def __init__(
+        self,
+        rows: Optional[List[Dict[str, Any]]] = None,
+        *,
+        last_row_id: int = 0,
+        changes: int = 0,
+    ) -> None:
+        self._rows = rows or []
+        self._index = 0
+        self.lastrowid = int(last_row_id or 0)
+        self.rowcount = int(changes or 0)
+
+    def fetchone(self) -> Optional[Dict[str, Any]]:
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return row
+
+    def fetchall(self) -> List[Dict[str, Any]]:
+        if self._index >= len(self._rows):
+            return []
+        rows = self._rows[self._index :]
+        self._index = len(self._rows)
+        return rows
+
+
+class D1Connection:
+    """Cloudflare D1 HTTP 连接封装，暴露 execute/commit 接口。"""
+
+    def __init__(self, credentials: D1Credentials) -> None:
+        self._credentials = credentials
+        self._api_url = (
+            f"{D1_API_BASE_URL}/accounts/{credentials.account_id}/d1/"
+            f"database/{credentials.database_id}/query"
+        )
+
+    def execute(self, sql: str, params: Optional[Sequence[Any]] = None) -> D1Cursor:
+        payload: Dict[str, Any] = {"sql": sql}
+        if params:
+            payload["params"] = list(params)
+
+        request = urllib.request.Request(
+            self._api_url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self._credentials.api_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=HTTP_CONNECTION_TIMEOUT_SECONDS
+            ) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Cloudflare D1 请求失败（HTTP {exc.code}）：{detail}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Cloudflare D1 网络异常：{exc.reason}") from exc
+
+        parsed = json.loads(body)
+        if not parsed.get("success"):
+            raise RuntimeError(f"Cloudflare D1 API 返回失败：{parsed}")
+
+        result = (parsed.get("result") or [{}])[0]
+        if not result.get("success", True):
+            raise RuntimeError(f"Cloudflare D1 SQL 执行失败：{result}")
+
+        rows = result.get("results") or []
+        meta = result.get("meta") or {}
+        return D1Cursor(
+            rows=rows,
+            last_row_id=int(meta.get("last_row_id") or 0),
+            changes=int(meta.get("changes") or 0),
+        )
+
+    def commit(self) -> None:
+        """D1 每次 execute 即完成提交，此处保持接口兼容。"""
+        return None
+
+    def close(self) -> None:
+        """HTTP 无持久连接对象，保持接口兼容。"""
+        return None
 
 
 def _is_sequence_row(row: Any) -> bool:
@@ -272,29 +381,67 @@ def update_task_content(
     _update_fields(task_id, fields, db_path)
 
 
-def get_task(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> Optional[Task]:
+def get_task(
+    task_id: int,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    include_content: bool = True,
+) -> Optional[Task]:
     """
     按主键获取单条任务记录。
 
     Args:
         task_id: 任务主键。
         db_path: 数据库文件路径。
+        include_content: 是否返回 transcript/summary 全文。
 
     Returns:
         对应的 Task 对象，未找到时返回 None。
     """
+    if include_content:
+        sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               transcript_text, summary_text, status, created_at
+        FROM tasks
+        WHERE id = ?
+        """
+    else:
+        sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               NULL AS transcript_text, NULL AS summary_text, status, created_at
+        FROM tasks
+        WHERE id = ?
+        """
+
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(sql, (task_id,))
+        row = cursor.fetchone()
+        return Task.from_row(row) if row else None
+
+
+def get_task_summary(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> Optional[str]:
+    """按任务 ID 读取总结文本。"""
     with get_connection(db_path) as connection:
         cursor = connection.execute(
-            """
-            SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
-                   transcript_text, summary_text, status, created_at
-            FROM tasks
-            WHERE id = ?
-            """,
+            "SELECT summary_text FROM tasks WHERE id = ?",
             (task_id,),
         )
         row = cursor.fetchone()
-        return Task.from_row(row) if row else None
+        if not row:
+            return None
+        return row[0] if _is_sequence_row(row) else row["summary_text"]
+
+
+def get_task_transcript(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> Optional[str]:
+    """按任务 ID 读取转录文本。"""
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            "SELECT transcript_text FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return row[0] if _is_sequence_row(row) else row["transcript_text"]
 
 
 def list_tasks(
@@ -364,6 +511,96 @@ def count_tasks(
         if not row:
             return 0
         return int(_single_column_value(row, "total") or 0)
+
+
+def list_tasks_paginated_with_total(
+    page: int,
+    page_size: int,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    include_content: bool = False,
+    title_keyword: Optional[str] = None,
+) -> tuple[List[Task], int]:
+    """
+    在同一连接内读取分页数据与总数，减少页面渲染时的数据库往返次数。
+
+    Args:
+        page: 页码（从 1 开始）。
+        page_size: 每页条数。
+        db_path: 数据库文件路径。
+        include_content: 是否返回 transcript/summary 全文。
+        title_keyword: 标题模糊搜索关键词（可选）。
+
+    Returns:
+        (当前页任务列表, 总条数)。
+    """
+    normalized_page = max(int(page), 1)
+    normalized_page_size = max(int(page_size), 1)
+    pattern: Optional[str] = None
+    if title_keyword and title_keyword.strip():
+        pattern = _build_like_pattern(title_keyword.strip())
+
+    if include_content and pattern is not None:
+        page_sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               transcript_text, summary_text, status, created_at
+        FROM tasks
+        WHERE video_title LIKE ? ESCAPE '\\'
+        ORDER BY datetime(created_at) DESC
+        LIMIT ? OFFSET ?
+        """
+    elif include_content:
+        page_sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               transcript_text, summary_text, status, created_at
+        FROM tasks
+        ORDER BY datetime(created_at) DESC
+        LIMIT ? OFFSET ?
+        """
+    elif pattern is not None:
+        page_sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               NULL AS transcript_text, NULL AS summary_text, status, created_at
+        FROM tasks
+        WHERE video_title LIKE ? ESCAPE '\\'
+        ORDER BY datetime(created_at) DESC
+        LIMIT ? OFFSET ?
+        """
+    else:
+        page_sql = """
+        SELECT id, bilibili_url, video_title, video_duration_seconds, audio_file_path,
+               NULL AS transcript_text, NULL AS summary_text, status, created_at
+        FROM tasks
+        ORDER BY datetime(created_at) DESC
+        LIMIT ? OFFSET ?
+        """
+
+    with get_connection(db_path) as connection:
+        if pattern is not None:
+            total_cursor = connection.execute(
+                "SELECT COUNT(1) AS total FROM tasks WHERE video_title LIKE ? ESCAPE '\\'",
+                (pattern,),
+            )
+        else:
+            total_cursor = connection.execute("SELECT COUNT(1) AS total FROM tasks")
+
+        total_row = total_cursor.fetchone()
+        total_count = int(_single_column_value(total_row, "total") or 0) if total_row else 0
+        if total_count <= 0:
+            return [], 0
+
+        total_pages = max((total_count + normalized_page_size - 1) // normalized_page_size, 1)
+        normalized_page = min(normalized_page, total_pages)
+        offset = (normalized_page - 1) * normalized_page_size
+
+        if pattern is not None:
+            params: tuple[Any, ...] = (pattern, normalized_page_size, offset)
+        else:
+            params = (normalized_page_size, offset)
+
+        cursor = connection.execute(page_sql, params)
+        rows = cursor.fetchall()
+        tasks = [Task.from_row(row) for row in rows]
+        return tasks, total_count
 
 
 def list_tasks_paginated(
@@ -502,11 +739,14 @@ def get_connection(
         db_path: 数据库文件路径。
 
     Yields:
-        已配置 row_factory 的 sqlite3.Connection。
+        可执行 SQL 的连接对象（sqlite/libsql/Cloudflare D1）。
     """
-    use_turso = _should_use_turso(db_path)
-    if use_turso:
-        connection = _connect_turso(db_path)
+    should_close = False
+    if _should_use_cloudflare_d1(db_path):
+        connection = _connect_cloudflare_d1(db_path)
+        should_close = True
+    elif _should_use_turso(db_path):
+        connection = _get_or_create_turso_connection(db_path)
     else:
         path = _normalize_db_path(db_path)
         connection = sqlite3.connect(
@@ -516,10 +756,12 @@ def get_connection(
             detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
         )
         connection.row_factory = sqlite3.Row
+        should_close = True
     try:
         yield connection
     finally:
-        connection.close()
+        if should_close:
+            connection.close()
 
 
 def _update_fields(
@@ -563,6 +805,9 @@ def _normalize_db_path(db_path: Path | str) -> Path:
 
 
 def _build_init_key(db_path: Path | str) -> str:
+    if _should_use_cloudflare_d1(db_path):
+        credentials = _resolve_cloudflare_d1_credentials(db_path)
+        return f"d1::{credentials.account_id}::{credentials.database_id}"
     if _should_use_turso(db_path):
         url = _resolve_turso_url(db_path)
         replica = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
@@ -619,12 +864,46 @@ def _is_remote_target(db_path: Path | str) -> bool:
 
 def _is_default_db_path(db_path: Path | str) -> bool:
     try:
-        return Path(db_path).expanduser().resolve() == Path(DEFAULT_DB_PATH).expanduser().resolve()
+        return Path(db_path).expanduser().resolve() == Path(
+            DEFAULT_DB_PATH
+        ).expanduser().resolve()
     except Exception:  # noqa: BLE001
         return False
 
 
+def _has_cloudflare_d1_config() -> bool:
+    return bool(
+        CLOUDFLARE_ACCOUNT_ID
+        and CLOUDFLARE_D1_DATABASE_ID
+        and CLOUDFLARE_API_TOKEN
+    )
+
+
+def _should_use_cloudflare_d1(db_path: Path | str) -> bool:
+    if not _has_cloudflare_d1_config():
+        return False
+    return _is_default_db_path(db_path)
+
+
+def _resolve_cloudflare_d1_credentials(db_path: Path | str) -> D1Credentials:
+    if not _should_use_cloudflare_d1(db_path):
+        raise RuntimeError("Cloudflare D1 未启用：缺少凭据或目标不是默认数据库。")
+
+    return D1Credentials(
+        account_id=str(CLOUDFLARE_ACCOUNT_ID),
+        database_id=str(CLOUDFLARE_D1_DATABASE_ID),
+        api_token=str(CLOUDFLARE_API_TOKEN),
+    )
+
+
+def _connect_cloudflare_d1(db_path: Path | str) -> D1Connection:
+    credentials = _resolve_cloudflare_d1_credentials(db_path)
+    return D1Connection(credentials)
+
+
 def _should_use_turso(db_path: Path | str) -> bool:
+    if _should_use_cloudflare_d1(db_path):
+        return False
     if _is_remote_target(db_path):
         return True
     if _is_default_db_path(db_path) and TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
@@ -662,6 +941,41 @@ def _connect_turso(db_path: Path | str) -> Any:
     if hasattr(connection, "row_factory"):
         connection.row_factory = sqlite3.Row
     return connection
+
+
+def _get_or_create_turso_connection(db_path: Path | str) -> Any:
+    """
+    获取当前线程复用的 Turso 连接，避免每次查询重复建连带来的高延迟。
+
+    说明：
+    - Streamlit 单个会话内的请求通常串行执行，线程内复用连接可显著降低页面读取耗时。
+    - 如果连接失效，会自动重建。
+    """
+    cache: Dict[str, Any] = getattr(_TURSO_CONNECTION_LOCAL, "connections", {})
+    cache_key = _build_turso_connection_cache_key(db_path)
+    connection = cache.get(cache_key)
+
+    if connection is not None:
+        try:
+            connection.execute("SELECT 1")
+            return connection
+        except Exception:  # noqa: BLE001
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    connection = _connect_turso(db_path)
+    cache[cache_key] = connection
+    _TURSO_CONNECTION_LOCAL.connections = cache
+    return connection
+
+
+def _build_turso_connection_cache_key(db_path: Path | str) -> str:
+    """构造 Turso 连接缓存键，区分不同远端 URL 与本地 replica 路径。"""
+    turso_url = _resolve_turso_url(db_path)
+    replica_path = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
+    return f"{turso_url}::{replica_path}"
 
 
 def _commit_connection(connection: Any, sync_remote: bool) -> None:
@@ -720,7 +1034,7 @@ def _validate_status(status: str) -> str:
     return status
 
 
-def _ensure_extra_columns(connection: sqlite3.Connection) -> None:
+def _ensure_extra_columns(connection: Any) -> None:
     """为旧表补充新增列，避免因 schema 变更导致异常。"""
     cursor = connection.execute("PRAGMA table_info(tasks);")
     existing = {_table_info_name(row) for row in cursor.fetchall()}
@@ -729,7 +1043,7 @@ def _ensure_extra_columns(connection: sqlite3.Connection) -> None:
     _ensure_transcription_columns(connection)
 
 
-def _ensure_transcription_columns(connection: sqlite3.Connection) -> None:
+def _ensure_transcription_columns(connection: Any) -> None:
     """为转写进度功能添加必要字段（幂等操作）。"""
     cursor = connection.execute("PRAGMA table_info(tasks);")
     existing = {_table_info_name(row) for row in cursor.fetchall()}
@@ -848,6 +1162,32 @@ def get_transcription_progress(
         if not progress_raw:
             return None
         return json.loads(progress_raw)
+
+
+def reset_transcription_data(
+    task_id: int, db_path: Path | str = DEFAULT_DB_PATH
+) -> None:
+    """
+    清空任务的转写进度与文本结果，用于从头重新转写。
+
+    Args:
+        task_id: 任务主键。
+        db_path: 数据库文件路径。
+    """
+    with get_connection(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE tasks
+            SET transcript_text = NULL,
+                summary_text = NULL,
+                transcription_progress = NULL,
+                transcription_total_chunks = NULL,
+                transcription_completed_chunks = NULL
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        _commit_connection(connection, sync_remote=True)
 
 
 def assemble_partial_transcript(

@@ -9,10 +9,17 @@ import re
 from datetime import datetime
 from textwrap import dedent
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 import streamlit as st
 
-from db.database import Task, TaskStatus, count_tasks, delete_task, init_db, list_tasks_paginated
+from db.database import (
+    Task,
+    TaskStatus,
+    delete_task,
+    init_db,
+    list_tasks_paginated_with_total,
+)
 
 STATUS_STYLE_MAP = {
     TaskStatus.COMPLETED.value: ("成功", "status-success"),
@@ -25,6 +32,10 @@ STATUS_STYLE_MAP = {
 BV_PATTERN = re.compile(r"(BV[0-9A-Za-z]+)", re.IGNORECASE)
 PAGE_SIZE_OPTIONS = (10, 20)
 DEFAULT_PAGE_SIZE = 10
+QUERY_PAGE_KEY = "page"
+QUERY_PAGE_SIZE_KEY = "page_size"
+QUERY_SEARCH_KEY = "q"
+QUERY_DELETE_KEY = "delete_task"
 
 
 def main() -> None:
@@ -41,7 +52,9 @@ def main() -> None:
         if st.button("⬅️ 返回工作台", type="primary", use_container_width=True):
             st.switch_page("app.py")
     with refresh_col:
-        st.button("🔄 刷新", use_container_width=True, key="refresh_history")
+        if st.button("🔄 刷新", use_container_width=True, key="refresh_history"):
+            _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
+            st.rerun()
 
     st.title("历史记录")
     st.caption("按时间倒序展示任务。可点击链接打开原视频，或从“操作”列进入工作台详情。")
@@ -72,13 +85,15 @@ def main() -> None:
 
 def _ensure_pagination_state() -> None:
     if "history_page" not in st.session_state:
-        st.session_state.history_page = 1
+        st.session_state.history_page = _read_positive_int_query_param(QUERY_PAGE_KEY) or 1
     if "history_page_size" not in st.session_state:
-        st.session_state.history_page_size = DEFAULT_PAGE_SIZE
+        query_page_size = _read_positive_int_query_param(QUERY_PAGE_SIZE_KEY)
+        st.session_state.history_page_size = _normalize_page_size(query_page_size)
     if "history_search_keyword" not in st.session_state:
-        st.session_state.history_search_keyword = ""
+        st.session_state.history_search_keyword = _read_text_query_param(QUERY_SEARCH_KEY)
     if "history_search_input" not in st.session_state:
         st.session_state.history_search_input = st.session_state.history_search_keyword
+    _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
 
 
 def _render_search_bar() -> None:
@@ -107,12 +122,14 @@ def _apply_search_keyword() -> None:
     keyword = str(st.session_state.get("history_search_input", "")).strip()
     st.session_state.history_search_keyword = keyword
     st.session_state.history_page = 1
+    _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
 
 
 def _clear_search_keyword() -> None:
     st.session_state.history_search_input = ""
     st.session_state.history_search_keyword = ""
     st.session_state.history_page = 1
+    _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
 
 
 def _load_tasks_page(
@@ -121,21 +138,20 @@ def _load_tasks_page(
     title_keyword: Optional[str] = None,
 ) -> Optional[tuple[list[Task], int]]:
     try:
-        total_count = count_tasks(title_keyword=title_keyword)
-        if total_count <= 0:
-            st.session_state.history_page = 1
-            return [], 0
-
-        total_pages = _calculate_total_pages(total_count=total_count, page_size=page_size)
-        normalized_page = min(max(int(page), 1), total_pages)
-        st.session_state.history_page = normalized_page
-
-        tasks = list_tasks_paginated(
-            page=normalized_page,
+        tasks, total_count = list_tasks_paginated_with_total(
+            page=page,
             page_size=page_size,
             include_content=False,
             title_keyword=title_keyword,
         )
+        if total_count <= 0:
+            st.session_state.history_page = 1
+            _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
+            return [], 0
+
+        total_pages = _calculate_total_pages(total_count=total_count, page_size=page_size)
+        st.session_state.history_page = min(max(int(page), 1), total_pages)
+        _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
         return tasks, total_count
     except Exception as exc:  # noqa: BLE001
         st.warning(f"数据库暂不可用：{exc}")
@@ -174,12 +190,14 @@ def _render_pagination(total_count: int, page_size: int) -> None:
     if total_count <= 0:
         return
 
-    total_pages = _calculate_total_pages(total_count=total_count, page_size=page_size)
+    normalized_page_size = _normalize_page_size(page_size)
+    st.session_state.history_page_size = normalized_page_size
+    total_pages = _calculate_total_pages(total_count=total_count, page_size=normalized_page_size)
     current_page = max(min(int(st.session_state.history_page), total_pages), 1)
     st.session_state.history_page = current_page
 
-    start_idx = (current_page - 1) * page_size + 1
-    end_idx = min(current_page * page_size, total_count)
+    start_idx = (current_page - 1) * normalized_page_size + 1
+    end_idx = min(current_page * normalized_page_size, total_count)
 
     spacer_col, size_col, page_col, prev_col, next_col = st.columns([4, 1, 2, 1, 1], vertical_alignment="center")
     with spacer_col:
@@ -188,23 +206,26 @@ def _render_pagination(total_count: int, page_size: int) -> None:
         selected_page_size = st.selectbox(
             "每页条数",
             options=PAGE_SIZE_OPTIONS,
-            index=PAGE_SIZE_OPTIONS.index(st.session_state.history_page_size),
+            index=PAGE_SIZE_OPTIONS.index(normalized_page_size),
             key="history_page_size_selector_bottom",
             label_visibility="collapsed",
         )
         if int(selected_page_size) != int(st.session_state.history_page_size):
             st.session_state.history_page_size = int(selected_page_size)
             st.session_state.history_page = 1
+            _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
             st.rerun()
     with page_col:
         st.caption(f"第 {current_page}/{total_pages} 页 · {start_idx}-{end_idx}/{total_count}")
     with prev_col:
         if st.button("上一页", use_container_width=True, disabled=current_page <= 1, key="history_prev_page"):
             st.session_state.history_page = current_page - 1
+            _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
             st.rerun()
     with next_col:
         if st.button("下一页", use_container_width=True, disabled=current_page >= total_pages, key="history_next_page"):
             st.session_state.history_page = current_page + 1
+            _sync_history_query_params(pending_delete_id=_peek_delete_task_id())
             st.rerun()
 
 
@@ -232,8 +253,7 @@ def _build_task_row_html(task: Task) -> str:
     safe_status_text = html.escape(status_text, quote=False)
 
     detail_link = html.escape(f"/?task_id={task.id}", quote=True)
-    delete_link = html.escape(f"?confirm_delete={task.id}", quote=True)
-    confirm_text = html.escape("确定要删除这条记录吗？", quote=True)
+    delete_link = html.escape(_build_delete_link(task.id), quote=True)
 
     row_html = dedent(
         f"""
@@ -249,7 +269,6 @@ def _build_task_row_html(task: Task) -> str:
                 class="action-link delete-link"
                 href="{delete_link}"
                 target="_self"
-                onclick="event.stopPropagation(); return window.confirm('{confirm_text}');"
               >删除</a>
             </div>
           </td>
@@ -292,36 +311,109 @@ def _resolve_status_style(status: str) -> tuple[str, str]:
     return status, "status-default"
 
 
+def _build_delete_link(task_id: int) -> str:
+    params = {
+        QUERY_PAGE_KEY: str(max(int(st.session_state.get("history_page", 1)), 1)),
+        QUERY_PAGE_SIZE_KEY: str(_normalize_page_size(st.session_state.get("history_page_size"))),
+        QUERY_DELETE_KEY: str(task_id),
+    }
+    keyword = str(st.session_state.get("history_search_keyword", "")).strip()
+    if keyword:
+        params[QUERY_SEARCH_KEY] = keyword
+    return f"?{urlencode(params)}"
+
+
 def _handle_pending_delete() -> None:
-    pending_delete_id = _consume_int_query_param("confirm_delete")
+    pending_delete_id = _peek_delete_task_id()
     if pending_delete_id is None:
         return
 
-    try:
-        delete_task(pending_delete_id)
-        st.toast(f"🗑️ 已删除记录 #{pending_delete_id}")
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"删除失败：{exc}")
-    st.rerun()
+    st.warning(f"将删除记录 #{pending_delete_id}，此操作不可恢复。")
+    confirm_col, cancel_col, _ = st.columns([1, 1, 6], vertical_alignment="center")
+    with confirm_col:
+        if st.button("确认删除", type="primary", use_container_width=True, key=f"confirm_delete_{pending_delete_id}"):
+            try:
+                delete_task(pending_delete_id)
+                st.toast(f"🗑️ 已删除记录 #{pending_delete_id}")
+                _sync_history_query_params(pending_delete_id=None)
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"删除失败：{exc}")
+    with cancel_col:
+        if st.button("取消删除", use_container_width=True, key=f"cancel_delete_{pending_delete_id}"):
+            _sync_history_query_params(pending_delete_id=None)
+            st.rerun()
 
 
-def _consume_int_query_param(param_name: str) -> Optional[int]:
+def _peek_delete_task_id() -> Optional[int]:
+    return _read_positive_int_query_param(QUERY_DELETE_KEY)
+
+
+def _read_positive_int_query_param(param_name: str) -> Optional[int]:
     raw_value: Any = st.query_params.get(param_name)
-    if raw_value is None:
-        return None
     if isinstance(raw_value, list):
         raw_value = raw_value[0] if raw_value else None
+    if raw_value is None:
+        return None
 
     try:
         value = int(str(raw_value))
     except (TypeError, ValueError):
-        value = None
+        return None
+    return value if value > 0 else None
 
+
+def _read_text_query_param(param_name: str) -> str:
+    raw_value: Any = st.query_params.get(param_name)
+    if isinstance(raw_value, list):
+        raw_value = raw_value[0] if raw_value else ""
+    if raw_value is None:
+        return ""
+    return str(raw_value).strip()
+
+
+def _normalize_page_size(page_size: Any) -> int:
     try:
-        del st.query_params[param_name]
-    except Exception:  # noqa: BLE001
-        pass
-    return value if value and value > 0 else None
+        value = int(page_size)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_SIZE
+    if value not in PAGE_SIZE_OPTIONS:
+        return DEFAULT_PAGE_SIZE
+    return value
+
+
+def _sync_history_query_params(pending_delete_id: Optional[int]) -> None:
+    target_params = {
+        QUERY_PAGE_KEY: str(max(int(st.session_state.get("history_page", 1)), 1)),
+        QUERY_PAGE_SIZE_KEY: str(
+            _normalize_page_size(st.session_state.get("history_page_size", DEFAULT_PAGE_SIZE))
+        ),
+    }
+    keyword = str(st.session_state.get("history_search_keyword", "")).strip()
+    if keyword:
+        target_params[QUERY_SEARCH_KEY] = keyword
+    if pending_delete_id and pending_delete_id > 0:
+        target_params[QUERY_DELETE_KEY] = str(pending_delete_id)
+
+    current_params: dict[str, str] = {}
+    for key in st.query_params.keys():
+        raw_value: Any = st.query_params.get(key)
+        if isinstance(raw_value, list):
+            raw_value = raw_value[0] if raw_value else ""
+        if raw_value is None:
+            continue
+        current_params[str(key)] = str(raw_value)
+
+    reserved_keys = {QUERY_PAGE_KEY, QUERY_PAGE_SIZE_KEY, QUERY_SEARCH_KEY, QUERY_DELETE_KEY}
+    passthrough_params = {k: v for k, v in current_params.items() if k not in reserved_keys}
+    merged_params = {**passthrough_params, **target_params}
+    if current_params == merged_params:
+        return
+
+    for key in list(st.query_params.keys()):
+        del st.query_params[key]
+    for key, value in merged_params.items():
+        st.query_params[key] = value
 
 
 def _inject_table_styles() -> None:

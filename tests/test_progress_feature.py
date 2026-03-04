@@ -15,6 +15,9 @@ from db.database import (
     update_transcription_progress,
     get_transcription_progress,
     assemble_partial_transcript,
+    reset_transcription_data,
+    get_task,
+    update_task_content,
     get_connection,
 )
 
@@ -212,6 +215,59 @@ def test_resume_from_chunks():
         db_path.unlink(missing_ok=True)
 
 
+def test_reset_transcription_data():
+    """测试从头重转前清空进度与文本。"""
+    print("\n测试 5: 清空转写数据...")
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        init_db(db_path)
+        task_id = create_task(
+            bilibili_url="https://test.com",
+            video_title="测试视频",
+            db_path=db_path
+        )
+
+        update_transcription_progress(
+            task_id=task_id,
+            chunk_index=0,
+            total_chunks=2,
+            chunk_text="已有转写",
+            start_sec=0,
+            end_sec=300,
+            db_path=db_path
+        )
+        update_task_content(
+            task_id=task_id,
+            transcript_text="已有转写全文",
+            summary_text="已有总结",
+            db_path=db_path
+        )
+
+        reset_transcription_data(task_id, db_path=db_path)
+
+        task = get_task(task_id, db_path=db_path, include_content=True)
+        progress = get_transcription_progress(task_id, db_path=db_path)
+        if task is None:
+            print("  ❌ 任务不存在")
+            return False
+        if task.transcript_text is not None:
+            print("  ❌ transcript_text 未清空")
+            return False
+        if task.summary_text is not None:
+            print("  ❌ summary_text 未清空")
+            return False
+        if progress is not None:
+            print("  ❌ transcription_progress 未清空")
+            return False
+        print("  ✓ 转写数据已清空")
+        return True
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("转写进度功能测试")
@@ -222,6 +278,7 @@ if __name__ == "__main__":
     results.append(test_progress_update())
     results.append(test_partial_transcript())
     results.append(test_resume_from_chunks())
+    results.append(test_reset_transcription_data())
 
     print("\n" + "=" * 60)
     passed = sum(results)

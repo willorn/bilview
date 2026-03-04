@@ -33,9 +33,12 @@ from db.database import (
     delete_tasks_before,
     delete_tasks_by_status,
     get_task,
+    get_task_summary,
+    get_task_transcript,
     get_transcription_progress,
     init_db,
     list_tasks,
+    reset_transcription_data,
     update_task_content,
     update_task_status,
     update_transcription_progress,
@@ -59,6 +62,8 @@ SUMMARY_MODEL_OPTIONS = [
 ]
 REGEN_FEEDBACK_SESSION_KEY = "regen_feedback"
 REGEN_ACTION_DEBOUNCE_SECONDS = 1.2
+REGEN_RUNNING_TASK_SESSION_KEY = "regen_running_task_id"
+TASK_TEXT_CACHE_SESSION_KEY = "task_text_cache"
 TRANSCRIBE_MODEL_SIZE = "medium"
 
 
@@ -220,7 +225,7 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
 
 def _render_running_task(task_id: int) -> Optional[str]:
     try:
-        task = get_task(task_id)
+        task = get_task(task_id, include_content=False)
     except Exception:  # noqa: BLE001
         return f"正在处理任务 #{task_id}，请稍候..."
 
@@ -262,6 +267,7 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
         return
 
     options = {t.id: f"#{t.id} | {STATUS_MAP.get(t.status, t.status)} | {t.video_title or '未命名'}" for t in tasks}
+    task_map = {t.id: t for t in tasks}
     task_ids = list(options.keys())
     default_index = 0
     if default_task_id in options:
@@ -272,11 +278,13 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
         index=default_index,
         format_func=lambda tid: options.get(tid, str(tid)),
     )
-    try:
-        task = get_task(selected_id)
-    except Exception as exc:  # noqa: BLE001
-        _render_db_not_ready_hint(exc, button_key="init_db_from_history_get")
-        return
+    task = task_map.get(selected_id)
+    if task is None:
+        try:
+            task = get_task(selected_id, include_content=False)
+        except Exception as exc:  # noqa: BLE001
+            _render_db_not_ready_hint(exc, button_key="init_db_from_history_get")
+            return
 
     if not task:
         st.warning("任务不存在")
@@ -289,17 +297,28 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
     _render_regen_feedback(task.id)
 
     _inject_reading_experience_styles()
-    summary_tab, transcript_tab = st.tabs(["核心总结", "完整转录"])
+    detail_view = st.radio(
+        "内容视图",
+        options=("核心总结", "完整转录"),
+        horizontal=True,
+        key=f"detail_view_{task.id}",
+    )
 
-    with summary_tab:
+    if detail_view == "核心总结":
+        summary_text = _get_cached_task_text(task.id, "summary")
+        if summary_text is None:
+            with st.spinner("正在加载总结内容..."):
+                _load_summary_to_cache(task.id)
+            summary_text = _get_cached_task_text(task.id, "summary") or ""
+
         summary_header_col, summary_action_col = st.columns([5, 1], vertical_alignment="bottom")
         with summary_header_col:
             st.markdown("#### 核心总结")
         with summary_action_col:
-            if task.summary_text:
+            if summary_text:
                 st.download_button(
                     label="下载 MD",
-                    data=task.summary_text,
+                    data=summary_text,
                     file_name=f"task_{task.id}_summary.md",
                     mime="text/markdown",
                     type="primary",
@@ -307,26 +326,31 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
                     key=f"download_summary_{task.id}",
                 )
 
-        if task.summary_text:
-            st.markdown(task.summary_text)
+        if summary_text:
+            st.markdown(summary_text)
             summary_copy_button_html = create_task_copy_button(
                 task_id=task.id,
-                text_to_copy=task.summary_text,
+                text_to_copy=summary_text,
                 button_text="复制总结",
             )
             components.html(summary_copy_button_html, height=90, scrolling=False)
         else:
             st.info("暂无总结内容。")
+    else:
+        transcript_text = _get_cached_task_text(task.id, "transcript")
+        if transcript_text is None:
+            with st.spinner("正在加载转录文本..."):
+                _load_transcript_to_cache(task.id)
+            transcript_text = _get_cached_task_text(task.id, "transcript") or ""
 
-    with transcript_tab:
         transcript_header_col, transcript_action_col = st.columns([5, 1], vertical_alignment="bottom")
         with transcript_header_col:
             st.markdown("#### 完整转录")
         with transcript_action_col:
-            if task.transcript_text:
+            if transcript_text:
                 st.download_button(
                     label="下载 TXT",
-                    data=task.transcript_text,
+                    data=transcript_text,
                     file_name=f"task_{task.id}_transcript.txt",
                     mime="text/plain",
                     type="primary",
@@ -334,9 +358,9 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
                     key=f"download_transcript_{task.id}",
                 )
 
-        if task.transcript_text:
-            _render_transcript_reader(task.transcript_text)
-            transcript_copy_button_html = create_task_copy_button(task.id, task.transcript_text)
+        if transcript_text:
+            _render_transcript_reader(transcript_text)
+            transcript_copy_button_html = create_task_copy_button(task.id, transcript_text)
             components.html(transcript_copy_button_html, height=90, scrolling=False)
         else:
             st.info("暂无转录文本。")
@@ -352,15 +376,43 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
     # 显示转写进度信息
     if task.status == TaskStatus.FAILED.value:
         progress = get_transcription_progress(task.id)
-        if progress and progress.get("completed_chunks", 0) > 0:
+        has_progress = bool(progress and progress.get("completed_chunks", 0) > 0)
+        if has_progress:
             st.info(
                 f"转写进度：已完成 {progress['completed_chunks']}/{progress['total_chunks']} 个切片"
             )
-            if st.button("从断点继续转写", use_container_width=True, type="primary", key=f"retry_{task.id}"):
+        retry_col, restart_col = st.columns(2)
+        with retry_col:
+            if st.button(
+                "从断点继续转写",
+                use_container_width=True,
+                type="primary",
+                key=f"retry_{task.id}",
+                disabled=not has_progress,
+            ):
                 _retry_transcription(task)
+        with restart_col:
+            if st.button(
+                "从头开始转写",
+                use_container_width=True,
+                type="secondary",
+                key=f"restart_{task.id}",
+            ):
+                _restart_transcription(task)
+
+    regen_running = _is_regen_running(task.id)
+    if regen_running:
+        st.info("⏳ 正在重新生成总结，请勿重复点击。")
 
     if task.status in {TaskStatus.SUMMARIZING.value, TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}:
-        if st.button("重新生成总结", use_container_width=True, type="primary", key=f"regen_{task.id}"):
+        regen_btn_label = "重新生成中..." if regen_running else "重新生成总结"
+        if st.button(
+            regen_btn_label,
+            use_container_width=True,
+            type="primary",
+            key=f"regen_{task.id}",
+            disabled=regen_running,
+        ):
             if _allow_action(f"open_regen_dialog_{task.id}"):
                 st.session_state["show_regen_dialog"] = True
                 st.session_state["regen_task_id"] = task.id
@@ -442,6 +494,14 @@ def _set_regen_feedback(task_id: int, level: str, message: str) -> None:
     }
 
 
+def _is_regen_running(task_id: int) -> bool:
+    """判断当前任务是否处于重新生成中。"""
+    try:
+        return int(st.session_state.get(REGEN_RUNNING_TASK_SESSION_KEY, 0)) == int(task_id)
+    except (TypeError, ValueError):
+        return False
+
+
 def _allow_action(action_name: str, cooldown_seconds: float = REGEN_ACTION_DEBOUNCE_SECONDS) -> bool:
     """简单防抖：限制同一动作在短时间内重复触发。"""
     state_key = f"action_debounce::{action_name}"
@@ -480,6 +540,49 @@ def _render_regen_feedback(task_id: int) -> None:
         st.info(message)
 
     st.session_state.pop(REGEN_FEEDBACK_SESSION_KEY, None)
+
+
+def _ensure_task_text_cache() -> dict[int, dict[str, str]]:
+    """确保会话内任务文本缓存结构可用。"""
+    cache: Any = st.session_state.get(TASK_TEXT_CACHE_SESSION_KEY)
+    if isinstance(cache, dict):
+        return cache
+    new_cache: dict[int, dict[str, str]] = {}
+    st.session_state[TASK_TEXT_CACHE_SESSION_KEY] = new_cache
+    return new_cache
+
+
+def _get_cached_task_text(task_id: int, key: str) -> Optional[str]:
+    """读取指定任务的缓存文本，未命中返回 None。"""
+    cache = _ensure_task_text_cache()
+    task_cache = cache.get(task_id, {})
+    if not isinstance(task_cache, dict):
+        return None
+    value = task_cache.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _set_cached_task_text(task_id: int, key: str, content: str) -> None:
+    """写入指定任务的缓存文本。"""
+    cache = _ensure_task_text_cache()
+    task_cache = cache.get(task_id)
+    if not isinstance(task_cache, dict):
+        task_cache = {}
+    task_cache[key] = content
+    cache[task_id] = task_cache
+    st.session_state[TASK_TEXT_CACHE_SESSION_KEY] = cache
+
+
+def _load_summary_to_cache(task_id: int) -> None:
+    """从数据库按需读取总结并写入缓存。"""
+    summary_text = get_task_summary(task_id) or ""
+    _set_cached_task_text(task_id, "summary", summary_text)
+
+
+def _load_transcript_to_cache(task_id: int) -> None:
+    """从数据库按需读取转录并写入缓存。"""
+    transcript_text = get_task_transcript(task_id) or ""
+    _set_cached_task_text(task_id, "transcript", transcript_text)
 
 
 def _inject_reading_experience_styles() -> None:
@@ -583,25 +686,41 @@ def _render_regen_dialog(task: Task) -> None:
 
     @st.dialog("选择总结模型")
     def _dialog() -> None:
+        regen_running = _is_regen_running(task.id)
         selected_model = st.radio(
             "选择模型",
             options=model_values,
             index=default_index,
             format_func=lambda val: f"{label_map.get(val, val)}",
             key=f"regen_model_radio_{task.id}",
+            disabled=regen_running,
         )
         st.session_state["regen_model_choice"] = selected_model
-        st.caption("提示：当前模型高峰期可切换备用模型再试。")
+        if regen_running:
+            st.info("⏳ 正在生成总结，请耐心等待当前任务完成。")
+        else:
+            st.caption("提示：当前模型高峰期可切换备用模型再试。")
 
         col_confirm, col_cancel = st.columns(2)
         with col_confirm:
-            if st.button("开始生成", type="primary", use_container_width=True, key=f"confirm_regen_{task.id}"):
+            if st.button(
+                "开始生成",
+                type="primary",
+                use_container_width=True,
+                key=f"confirm_regen_{task.id}",
+                disabled=regen_running,
+            ):
                 if _allow_action(f"confirm_regen_{task.id}"):
                     _regenerate_summary(task, model=selected_model)
                 else:
                     st.info("点击过快，请稍后再试。")
         with col_cancel:
-            if st.button("取消", use_container_width=True, key=f"cancel_regen_{task.id}"):
+            if st.button(
+                "取消",
+                use_container_width=True,
+                key=f"cancel_regen_{task.id}",
+                disabled=regen_running,
+            ):
                 st.session_state["show_regen_dialog"] = False
                 st.session_state["regen_task_id"] = None
 
@@ -733,25 +852,35 @@ def _refresh_title(task_id: int, url: str) -> None:
 
 def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
     """使用已存转录重新生成总结，可指定模型。"""
-    if not task.transcript_text:
+    transcript_text = task.transcript_text or get_task_transcript(task.id)
+    if not transcript_text:
         _set_regen_feedback(task.id, "error", "暂无转录文本，无法生成总结")
         st.session_state["show_regen_dialog"] = False
         st.session_state["regen_task_id"] = None
         st.rerun()
         return
+    if _is_regen_running(task.id):
+        st.info("总结正在生成中，请勿重复提交。")
+        return
+
     chosen_model = model or st.session_state.get("regen_model_choice") or DEFAULT_LLM_MODEL
+    st.session_state[REGEN_RUNNING_TASK_SESSION_KEY] = task.id
     try:
-        update_task_status(task.id, TaskStatus.SUMMARIZING.value)
-        summary = summarizer_module.generate_summary(
-            task.transcript_text,
-            system_prompt=_get_active_prompt(),
-            model=chosen_model,
-        )
-        if not summary.strip():
-            raise RuntimeError("模型未返回有效总结内容，请切换模型后重试。")
-        update_task_content(task.id, summary_text=summary)
-        update_task_status(task.id, TaskStatus.COMPLETED.value)
-        _set_regen_feedback(task.id, "success", "总结已重新生成")
+        with st.status("重新生成总结中...", expanded=True) as status_box:
+            update_task_status(task.id, TaskStatus.SUMMARIZING.value)
+            status_box.write(f"已提交模型：{chosen_model}")
+            summary = summarizer_module.generate_summary(
+                transcript_text,
+                system_prompt=_get_active_prompt(),
+                model=chosen_model,
+            )
+            if not summary.strip():
+                raise RuntimeError("模型未返回有效总结内容，请切换模型后重试。")
+            update_task_content(task.id, summary_text=summary)
+            _set_cached_task_text(task.id, "summary", summary)
+            update_task_status(task.id, TaskStatus.COMPLETED.value)
+            status_box.update(label="总结重新生成完成", state="complete")
+            _set_regen_feedback(task.id, "success", "总结已重新生成")
     except Exception as exc:  # noqa: BLE001
         try:
             update_task_status(task.id, TaskStatus.FAILED.value)
@@ -764,13 +893,24 @@ def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
                 pass
         _set_regen_feedback(task.id, "error", f"重新生成失败：{exc}")
     finally:
+        st.session_state.pop(REGEN_RUNNING_TASK_SESSION_KEY, None)
         st.session_state["show_regen_dialog"] = False
         st.session_state["regen_task_id"] = None
     st.rerun()
 
 
 def _retry_transcription(task: Task) -> None:
-    """从断点继续转写失败的任务。"""
+    """从断点继续转写失败任务。"""
+    _run_transcription_flow(task, restart_from_scratch=False)
+
+
+def _restart_transcription(task: Task) -> None:
+    """清空历史转写结果后，从第一个切片重新转写。"""
+    _run_transcription_flow(task, restart_from_scratch=True)
+
+
+def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
+    """执行转写+总结流程，支持断点续传和从头重跑两种模式。"""
     if not task.audio_file_path:
         st.error("音频文件路径缺失，无法继续转写")
         return
@@ -780,16 +920,28 @@ def _retry_transcription(task: Task) -> None:
         st.error(f"音频文件不存在：{audio_path}")
         return
 
-    with st.status("继续转写中...", expanded=True) as status_box:
+    status_label = "从头重新转写中..." if restart_from_scratch else "继续转写中..."
+    success_message = "已从头完成转写" if restart_from_scratch else "转写已完成"
+    with st.status(status_label, expanded=True) as status_box:
         try:
             update_task_status(task.id, TaskStatus.TRANSCRIBING.value)
 
-            # 获取断点续传数据
-            existing_progress = get_transcription_progress(task.id)
             resume_chunks = None
-            if existing_progress:
-                resume_chunks = existing_progress["chunks"]
-                status_box.info(f"从第 {existing_progress['completed_chunks'] + 1} 个切片继续...")
+            if restart_from_scratch:
+                reset_transcription_data(task.id)
+                _set_cached_task_text(task.id, "transcript", "")
+                _set_cached_task_text(task.id, "summary", "")
+                status_box.info("已清空历史进度，将从第 1 个切片开始。")
+            else:
+                # 获取断点续传数据
+                existing_progress = get_transcription_progress(task.id)
+                if existing_progress:
+                    resume_chunks = existing_progress["chunks"]
+                    status_box.info(
+                        f"从第 {existing_progress['completed_chunks'] + 1} 个切片继续..."
+                    )
+                else:
+                    status_box.info("未检测到断点进度，将从第 1 个切片开始。")
 
             # 创建进度条
             progress_container = status_box.container()
@@ -820,21 +972,24 @@ def _retry_transcription(task: Task) -> None:
                 resume_from_chunks=resume_chunks,
             )
             update_task_content(task.id, transcript_text=transcript)
+            _set_cached_task_text(task.id, "transcript", transcript)
 
             # 继续总结
             update_task_status(task.id, TaskStatus.SUMMARIZING.value)
             status_box.write("总结中（LLM）...")
             summary = summarizer_module.generate_summary(transcript, system_prompt=_get_active_prompt())
             update_task_content(task.id, summary_text=summary)
+            _set_cached_task_text(task.id, "summary", summary)
 
             update_task_status(task.id, TaskStatus.COMPLETED.value)
             status_box.update(label="处理完成", state="complete")
-            st.success("转写已完成")
+            st.success(success_message)
         except Exception as exc:  # noqa: BLE001
             # 保存部分结果
             partial_transcript = assemble_partial_transcript(task.id)
             if partial_transcript:
                 update_task_content(task.id, transcript_text=partial_transcript)
+                _set_cached_task_text(task.id, "transcript", partial_transcript)
                 status_box.warning(f"转写部分完成（{len(partial_transcript)} 字符），但遇到错误")
 
             update_task_status(task.id, TaskStatus.FAILED.value)
