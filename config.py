@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
@@ -48,19 +48,59 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def get_api_key(env_name: str, default: Optional[str] = None) -> Optional[str]:
     """通用读取 API Key 的函数。"""
     return os.getenv(env_name, default)
 
 
+def get_api_keys(env_name: str) -> List[str]:
+    """读取逗号分隔的 API Key 列表。"""
+    raw_value = os.getenv(env_name, "")
+    if not raw_value:
+        return []
+    normalized = raw_value.replace("\n", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def _merge_unique_keys(*groups: List[str]) -> List[str]:
+    merged: List[str] = []
+    for group in groups:
+        for key in group:
+            if key not in merged:
+                merged.append(key)
+    return merged
+
+
 # 项目内默认使用的 key（可在 .env 中覆盖）
 X666_API_KEY = get_api_key("X666_API_KEY")
+GROQ_API_KEY = get_api_key("GROQ_API_KEY")
+GROQ_API_KEYS = _merge_unique_keys(
+    get_api_keys("GROQ_API_KEYS"),
+    [GROQ_API_KEY] if GROQ_API_KEY else [],
+)
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 CLOUDFLARE_D1_DATABASE_ID = os.getenv("CLOUDFLARE_D1_DATABASE_ID")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 DB_AUTO_INIT_ON_STARTUP = _env_bool("DB_AUTO_INIT_ON_STARTUP", default=False)
+DEFAULT_ASR_PROVIDER = os.getenv("ASR_PROVIDER", "groq").strip().lower() or "groq"
+DEFAULT_GROQ_ASR_BASE_URL = (
+    os.getenv("GROQ_ASR_BASE_URL", "https://api.groq.com/openai/v1").strip()
+    or "https://api.groq.com/openai/v1"
+)
+DEFAULT_GROQ_ASR_MODEL = os.getenv("GROQ_ASR_MODEL", "whisper-large-v3-turbo").strip() or "whisper-large-v3-turbo"
+ASR_REQUEST_TIMEOUT_SECONDS = _env_int("ASR_REQUEST_TIMEOUT_SECONDS", default=120)
 
 
 def ensure_api_key_present() -> None:

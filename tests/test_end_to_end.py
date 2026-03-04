@@ -84,6 +84,7 @@ def test_normal_transcription():
         # 执行转写
         transcript = audio_to_text(
             audio_path,
+            provider="local_whisper",
             model_size="tiny",
             progress_callback=progress_callback
         )
@@ -183,6 +184,7 @@ def test_chunked_transcription():
         # 执行转写
         transcript = audio_to_text(
             audio_path,
+            provider="local_whisper",
             model_size="tiny",
             chunk_duration_sec=300,  # 5 分钟切片
             progress_callback=progress_callback
@@ -296,6 +298,7 @@ def test_resume_from_checkpoint():
         # 从断点继续转写
         transcript = audio_to_text(
             audio_path,
+            provider="local_whisper",
             model_size="tiny",
             chunk_duration_sec=300,
             progress_callback=progress_callback,

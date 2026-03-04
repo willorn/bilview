@@ -1,9 +1,9 @@
 ## Bilibili 视频转录与智能总结工具
 
-本项目提供本地化的一键流程：输入 B 站链接 → 下载音频 → Whisper 转写 → LLM 总结 → 本地持久化与导出。
+本项目提供本地化的一键流程：输入 B 站链接 → 下载音频 → ASR 转写（默认 Groq）→ LLM 总结 → 本地持久化与导出。
 
 ### 主要特性
-- **全本地转写**：内置 Whisper（默认 tiny，可切换 base/small…），避免在线 ASR 成本。
+- **默认在线转写**：内置 Groq ASR（支持多 API Key 轮询），并保留本地 Whisper 兜底能力。
 - **一键流程**：Streamlit 界面触发，自动串联下载 / 转写 / 总结并写入数据库（默认 SQLite，可切换 Turso）。
 - **结果持久化**：默认写入 `/data/data/app.db`（如存在 HF /data 持久卷），否则使用仓库内 `data/app.db`，并可用环境变量 `BILVIEW_STORAGE_DIR` 自定义。
 - **可配置 LLM**：默认 `gemini-2.5-pro-1m`（x666 接口），支持自定义模型、温度、API Key。
@@ -16,7 +16,8 @@ app.py                # Streamlit 前端与流程编排
 config.py             # 配置与 .env 加载
 core/
   downloader.py       # yt-dlp 仅提取音频
-  transcriber.py      # Whisper 转写（分片+模型缓存+设备自动选择）
+  speech_recognition.py  # 语音识别封装（Groq + 本地 Whisper，支持多 key 轮询）
+  transcriber.py      # 转写编排（分片 + 断点续传 + 进度回调）
   summarizer.py       # LLM 调用与速率限制
 db/
   database.py         # SQLite 封装（init/CRUD）
@@ -34,17 +35,21 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
 
 
 ### 快速开始
-1) 安装依赖（已包含 yt-dlp / whisper / streamlit 等）  
+1) 安装依赖（已包含 yt-dlp / whisper / openai / streamlit 等）  
    ```bash
    pip install -r requirements.txt
    ```
-   需本地可用 `ffmpeg`；首次运行 Whisper 会下载模型（需联网）。
+   需本地可用 `ffmpeg`；若切到本地 Whisper 模式，首次运行会下载模型（需联网）。
 
 2) 配置 API Key（可选，默认使用文档示例值）  
    新建 `.env`（已被 .gitignore）：  
    ```
    X666_API_KEY=你的key
+   GROQ_API_KEYS=key1,key2,key3
    ```
+
+   可选：仅配置单个 Groq Key 时也可使用 `GROQ_API_KEY=xxx`。  
+   可选：`ASR_PROVIDER=groq`（默认）或 `ASR_PROVIDER=local_whisper`。
 
    若使用 Turso（云端免费数据库），额外配置：
    ```
@@ -67,9 +72,9 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
    浏览器打开 `http://localhost:8501`。
 
 ### 使用说明
-- 在输入框粘贴 B 站链接，点击“开始处理”。流程：下载 → 转写（Whisper） → 总结（LLM）。  
+- 在输入框粘贴 B 站链接，点击“开始处理”。流程：下载 → 转写（Groq ASR） → 总结（LLM）。  
 - 右侧历史记录可查看/下载逐字稿与总结。  
-- 转写默认使用 Whisper tiny、中文语言，超 25MB 或 5 分钟自动分片。  
+- 转写默认使用 Groq Whisper（中文语言），超 25MB 或 5 分钟自动分片。  
 - LLM 调用全局 20s 速率限制，超时/错误将把任务标记为失败。
 
 ### 移动端访问
@@ -80,7 +85,7 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
 
 ### 配置要点
 - Python 版本建议 3.10/3.12；若平台固定为 3.13，请确保 `audioop-lts` 已安装（requirements 已按条件依赖声明），或通过 `runtime.txt` 指定 3.12。
-- `.env`：`X666_API_KEY`（优先）；若配置 Cloudflare D1 三元组（`CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_D1_DATABASE_ID`、`CLOUDFLARE_API_TOKEN`）将优先使用 D1；否则如配置 `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`，默认数据库会自动切到 Turso。  
+- `.env`：`X666_API_KEY`（总结）、`GROQ_API_KEYS`（转写，支持逗号分隔轮询）；若配置 Cloudflare D1 三元组（`CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_D1_DATABASE_ID`、`CLOUDFLARE_API_TOKEN`）将优先使用 D1；否则如配置 `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`，默认数据库会自动切到 Turso。  
 - 可选：`DB_AUTO_INIT_ON_STARTUP=1` 启动时自动执行数据库初始化（默认关闭，推荐在“设置与清理 -> 数据库维护”手动触发）。  
 - `config.py`：`DEFAULT_LLM_API_URL`、`DEFAULT_LLM_MODEL`、`DB_PATH`、`DOWNLOAD_DIR` 等集中管理。  
 - 状态枚举：DB 中存英文 (`waiting/downloading/...`)，UI 层通过 `STATUS_MAP` 映射中文。
@@ -102,7 +107,7 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
   init_db()
   url = "https://b23.tv/dNNt3B6"
   audio = download_audio(url)
-  text = audio_to_text(audio, model_size="tiny", language="zh")
+  text = audio_to_text(audio, language="zh")
   print(generate_summary(text[:2000])[:200])
   PY
   ```
@@ -110,6 +115,6 @@ downloads/            # 存储根下的音频缓存目录（已忽略）
 
 ### 注意事项
 - `data/` 与 `downloads/` 已忽略，请勿提交运行期数据或音频文件。  
-- 如需 GPU/MPS 加速，安装对应的 `torch` 版本；代码会自动选择可用设备并在不支持时回退 CPU。  
-- 若需更高精度，可将 `model_size` 调为 `small/base/medium`，性能与显存占用相应上升。  
+- 如需本地 Whisper 的 GPU/MPS 加速，安装对应 `torch` 版本；代码会自动选择可用设备并在不支持时回退 CPU。  
+- 若需使用本地 Whisper，可将 `ASR_PROVIDER=local_whisper`，并通过 `model_size` 调整 `small/base/medium`。  
 - 若需更复杂的限流/重试策略，可在 `core/summarizer.py` 扩展。 

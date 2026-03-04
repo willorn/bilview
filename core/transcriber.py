@@ -1,37 +1,35 @@
 """
-模块描述：离线使用 Whisper 模型将音频转录为文本，可自动按时长分片。
+模块描述：音频转录编排层，负责切片、进度回调与断点续传。
 
 设计取舍：
-1. 默认使用本地 Whisper 模型（避免在线 API 成本），支持自定义模型体积。
-2. 当音频超过指定时长/体积时，利用 pydub 先切片，再逐段调用 Whisper 并拼接结果。
+1. 默认使用 Groq 语音识别（可通过 provider 切换到本地 Whisper）。
+2. 当音频超过指定时长/体积时，利用 pydub 先切片，再逐段调用识别引擎并拼接结果。
 3. 依赖 ffmpeg（已存在于环境中）完成音频解码。
 
 @author 开发
-@date 2026-02-23
-@version v1.0
+@date 2026-03-04
+@version v2.0
 """
 from __future__ import annotations
 
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from pydub import AudioSegment
-import torch
-import whisper
 
-# 规避 Streamlit 文件监控在检查 torch.classes.__path__ 时触发的 RuntimeError
-# 参考：https://discuss.streamlit.io/t/error-in-torch-with-streamlit/90908
-try:
-    torch.classes.__path__ = []  # type: ignore[attr-defined]
-except Exception:  # noqa: BLE001
-    # 若未来 PyTorch 调整实现，确保应用不因兜底处理失败而中断
-    pass
+from config import DEFAULT_ASR_PROVIDER, DEFAULT_GROQ_ASR_MODEL
+from core.speech_recognition import create_speech_recognizer
 
 DEFAULT_MODEL_SIZE = "base"
+DEFAULT_PROVIDER = DEFAULT_ASR_PROVIDER
+DEFAULT_ASR_MODEL = DEFAULT_GROQ_ASR_MODEL
 CHUNK_DURATION_SECONDS = 300  # 每段 5 分钟，兼顾稳定性与性能
 FILE_SIZE_LIMIT_MB = 25
-_MODEL_CACHE: Dict[Tuple[str, str], whisper.Whisper] = {}
+GROQ_PROVIDER = "groq"
+GROQ_CHUNK_FORMAT = "mp3"
+GROQ_CHUNK_SUFFIX = ".mp3"
+GROQ_CHUNK_BITRATE = "64k"
 
 
 def audio_to_text(
@@ -43,19 +41,25 @@ def audio_to_text(
     device: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, str, float, float], None]] = None,
     resume_from_chunks: Optional[List[Dict[str, Any]]] = None,
+    provider: str = DEFAULT_PROVIDER,
+    asr_model: str = DEFAULT_ASR_MODEL,
+    api_keys: Optional[Sequence[str]] = None,
 ) -> str:
     """
-    将音频文件转录为文本（离线 Whisper）。
+    将音频文件转录为文本（支持 Groq / 本地 Whisper）。
 
     Args:
         file_path: 输入音频文件路径。
-        model_size: Whisper 模型规格（tiny/base/small/medium/large-v3）。
+        model_size: 本地 Whisper 模型规格（provider=local_whisper 时生效）。
         language: 可选语言代码，None 时交由 Whisper 自动检测。
         chunk_duration_sec: 切片时长阈值（秒），超过则分片转录。
         file_size_limit_mb: 文件大小阈值（MB），超过则分片转录。
-        device: 推理设备（'cuda'/'mps'/'cpu'），None 时自动选择。
+        device: 本地推理设备（'cuda'/'mps'/'cpu'），None 时自动选择。
         progress_callback: 进度回调函数，签名为 (current, total, chunk_text, start_sec, end_sec)。
         resume_from_chunks: 断点续传数据，包含已完成切片的信息。
+        provider: 语音识别 provider，默认 `groq`。
+        asr_model: Groq 语音模型名（provider=groq 时生效）。
+        api_keys: 可选 API Key 列表（用于覆盖默认配置，支持轮询）。
 
     Returns:
         逐字稿文本（去除首尾空白）。
@@ -69,8 +73,13 @@ def audio_to_text(
         raise FileNotFoundError(f"音频文件不存在：{path}")
 
     try:
-        resolved_device = _auto_device(device)
-        model = _load_model_cached(model_size, resolved_device)
+        recognizer = create_speech_recognizer(
+            provider=provider,
+            model_size=model_size,
+            device=device,
+            groq_model=asr_model,
+            groq_api_keys=api_keys,
+        )
         audio = AudioSegment.from_file(path)
 
         needs_chunk = (
@@ -79,21 +88,30 @@ def audio_to_text(
         )
 
         if not needs_chunk:
-            result = model.transcribe(str(path), language=language, fp16=False)
-            text = result.get("text", "").strip()
-            # 即使不分片，也触发回调（作为单个完整切片）
-            if progress_callback:
-                progress_callback(1, 1, text, 0, audio.duration_seconds)
-            return text
+            try:
+                text = recognizer.transcribe_file(path, language=language)
+                # 即使不分片，也触发回调（作为单个完整切片）
+                if progress_callback:
+                    progress_callback(1, 1, text, 0, audio.duration_seconds)
+                return text
+            except Exception as exc:  # noqa: BLE001
+                if not _is_payload_too_large_error(exc):
+                    raise
+                # API 提示请求过大时，改走分片并压缩上传，避免 413 失败。
+                needs_chunk = True
 
         segments = _split_audio(audio, chunk_duration_sec)
         total_chunks = len(segments)
         texts: List[str] = []
+        chunk_format, chunk_suffix, export_kwargs = _resolve_chunk_export(provider)
 
         # 断点续传：跳过已完成切片
         start_index = 0
         if resume_from_chunks:
-            completed_chunks = [c for c in resume_from_chunks if c.get("completed")]
+            completed_chunks = sorted(
+                [chunk for chunk in resume_from_chunks if chunk.get("completed")],
+                key=lambda chunk: int(chunk.get("index", 0)),
+            )
             completed_texts = [c["text"] for c in completed_chunks if c.get("text")]
             texts.extend(completed_texts)
             start_index = len(completed_chunks)
@@ -103,12 +121,14 @@ def audio_to_text(
             start_sec = i * chunk_duration_sec
             end_sec = min((i + 1) * chunk_duration_sec, audio.duration_seconds)
 
-            with NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-                segment.export(tmp_file.name, format="wav")
-                result = model.transcribe(tmp_file.name, language=language, fp16=False)
-            Path(tmp_file.name).unlink(missing_ok=True)
+            with NamedTemporaryFile(suffix=chunk_suffix, delete=False) as tmp_file:
+                temp_path = Path(tmp_file.name)
+            try:
+                segment.export(temp_path, format=chunk_format, **export_kwargs)
+                chunk_text = recognizer.transcribe_file(temp_path, language=language)
+            finally:
+                temp_path.unlink(missing_ok=True)
 
-            chunk_text = result.get("text", "").strip()
             texts.append(chunk_text)
 
             # 触发进度回调
@@ -133,32 +153,19 @@ def _split_audio(audio: AudioSegment, chunk_duration_sec: int) -> List[AudioSegm
     ]
 
 
-def _auto_device(user_choice: Optional[str]) -> str:
-    """
-    自动推断可用设备。优先级：用户指定 > CUDA > MPS > CPU。
-    """
-    if user_choice:
-        return user_choice
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+def _resolve_chunk_export(provider: str) -> tuple[str, str, Dict[str, str]]:
+    """根据 provider 选择临时分片的导出格式。"""
+    if provider.strip().lower() == GROQ_PROVIDER:
+        return GROQ_CHUNK_FORMAT, GROQ_CHUNK_SUFFIX, {"bitrate": GROQ_CHUNK_BITRATE}
+    return "wav", ".wav", {}
 
 
-def _load_model_cached(model_size: str, device: str) -> whisper.Whisper:
-    """基于 (模型大小, 设备) 进行缓存，避免重复加载耗时。"""
-    key = (model_size, device)
-    cached = _MODEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        model = whisper.load_model(model_size, device=device)
-    except NotImplementedError:
-        if device != "cpu":
-            model = whisper.load_model(model_size, device="cpu")
-            key = (model_size, "cpu")
-        else:
-            raise
-    _MODEL_CACHE[key] = model
-    return model
+def _is_payload_too_large_error(exc: Exception) -> bool:
+    """判断错误是否为请求体过大（413）。"""
+    error_text = str(exc).lower()
+    return (
+        "413" in error_text
+        or "request entity too large" in error_text
+        or "payload too large" in error_text
+        or "request_too_large" in error_text
+    )

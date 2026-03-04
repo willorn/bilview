@@ -20,7 +20,14 @@ from yt_dlp import YoutubeDL
 
 from utils.network import get_lan_addresses
 from utils.url_helper import process_user_input
-from config import DB_AUTO_INIT_ON_STARTUP, DEFAULT_LLM_MODEL, DOWNLOAD_DIR, ensure_api_key_present
+from config import (
+    DB_AUTO_INIT_ON_STARTUP,
+    DEFAULT_ASR_PROVIDER,
+    DEFAULT_GROQ_ASR_MODEL,
+    DEFAULT_LLM_MODEL,
+    DOWNLOAD_DIR,
+    ensure_api_key_present,
+)
 from core.downloader import download_audio
 from core import summarizer as summarizer_module
 from core.transcriber import audio_to_text
@@ -64,7 +71,9 @@ REGEN_FEEDBACK_SESSION_KEY = "regen_feedback"
 REGEN_ACTION_DEBOUNCE_SECONDS = 1.2
 REGEN_RUNNING_TASK_SESSION_KEY = "regen_running_task_id"
 TASK_TEXT_CACHE_SESSION_KEY = "task_text_cache"
-TRANSCRIBE_MODEL_SIZE = "medium"
+TRANSCRIBE_PROVIDER = DEFAULT_ASR_PROVIDER
+TRANSCRIBE_API_MODEL = DEFAULT_GROQ_ASR_MODEL
+TRANSCRIBE_LOCAL_MODEL_SIZE = "medium"
 
 
 def _load_default_prompt() -> str:
@@ -201,7 +210,9 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
 
         transcript = audio_to_text(
             audio_path,
-            model_size=TRANSCRIBE_MODEL_SIZE,
+            provider=TRANSCRIBE_PROVIDER,
+            asr_model=TRANSCRIBE_API_MODEL,
+            model_size=TRANSCRIBE_LOCAL_MODEL_SIZE,
             language="zh",
             progress_callback=on_chunk_completed,
             resume_from_chunks=resume_chunks,
@@ -966,7 +977,9 @@ def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
             # 调用转写
             transcript = audio_to_text(
                 audio_path,
-                model_size=TRANSCRIBE_MODEL_SIZE,
+                provider=TRANSCRIBE_PROVIDER,
+                asr_model=TRANSCRIBE_API_MODEL,
+                model_size=TRANSCRIBE_LOCAL_MODEL_SIZE,
                 language="zh",
                 progress_callback=on_chunk_completed,
                 resume_from_chunks=resume_chunks,
