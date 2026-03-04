@@ -83,7 +83,12 @@ _GROQ_RETRYABLE_STATUS_CODES = {401, 403, 408, 409, 429, 500, 502, 503, 504}
 class SpeechRecognizer(Protocol):
     """统一语音识别接口。"""
 
-    def transcribe_file(self, file_path: Path | str, language: Optional[str] = None) -> str:
+    def transcribe_file(
+        self,
+        file_path: Path | str,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+    ) -> str:
         """识别单个音频文件并返回纯文本。"""
 
 
@@ -126,7 +131,12 @@ class GroqSpeechRecognizer:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
 
-    def transcribe_file(self, file_path: Path | str, language: Optional[str] = None) -> str:
+    def transcribe_file(
+        self,
+        file_path: Path | str,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+    ) -> str:
         """使用 Groq 接口识别单个音频文件。"""
         path = _resolve_audio_path(file_path)
         error_messages = []
@@ -134,7 +144,7 @@ class GroqSpeechRecognizer:
         for _ in range(self._key_pool.size):
             current_key = self._key_pool.get_next_key()
             try:
-                return self._transcribe_with_key(path, current_key, language)
+                return self._transcribe_with_key(path, current_key, language, prompt)
             except Exception as exc:  # noqa: BLE001
                 masked_key = _mask_api_key(current_key)
                 error_messages.append(f"{masked_key}: {exc}")
@@ -145,17 +155,28 @@ class GroqSpeechRecognizer:
         merged_errors = " | ".join(error_messages)
         raise RuntimeError(f"Groq 语音识别失败，所有 API Key 均不可用：{merged_errors}")
 
-    def _transcribe_with_key(self, path: Path, api_key: str, language: Optional[str]) -> str:
+    def _transcribe_with_key(
+        self,
+        path: Path,
+        api_key: str,
+        language: Optional[str],
+        prompt: Optional[str],
+    ) -> str:
         client = OpenAI(
             api_key=api_key,
             base_url=self._base_url,
             timeout=self._timeout,
         )
+        request_payload = {
+            "model": self._model,
+            "language": language,
+            "prompt": prompt,
+        }
+        payload = {key: value for key, value in request_payload.items() if value}
         with path.open("rb") as audio_file:
             response = client.audio.transcriptions.create(
-                model=self._model,
                 file=audio_file,
-                language=language,
+                **payload,
             )
         return _extract_transcript_text(response)
 
@@ -167,10 +188,20 @@ class LocalWhisperSpeechRecognizer:
         self._model_size = model_size
         self._device = _auto_device(device)
 
-    def transcribe_file(self, file_path: Path | str, language: Optional[str] = None) -> str:
+    def transcribe_file(
+        self,
+        file_path: Path | str,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+    ) -> str:
         path = _resolve_audio_path(file_path)
         model = _load_local_model_cached(self._model_size, self._device)
-        result = model.transcribe(str(path), language=language, fp16=False)
+        result = model.transcribe(
+            str(path),
+            language=language,
+            fp16=False,
+            initial_prompt=prompt,
+        )
         return str(result.get("text", "")).strip()
 
 

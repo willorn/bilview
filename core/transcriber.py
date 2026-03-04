@@ -42,6 +42,7 @@ def audio_to_text(
     file_path: Path | str,
     model_size: str = DEFAULT_MODEL_SIZE,
     language: Optional[str] = None,
+    transcription_prompt: Optional[str] = None,
     chunk_duration_sec: int = CHUNK_DURATION_SECONDS,
     file_size_limit_mb: int = FILE_SIZE_LIMIT_MB,
     device: Optional[str] = None,
@@ -58,6 +59,7 @@ def audio_to_text(
         file_path: 输入音频文件路径。
         model_size: 本地 Whisper 模型规格（provider=local_whisper 时生效）。
         language: 可选语言代码，None 时交由 Whisper 自动检测。
+        transcription_prompt: 可选转写提示词（用于引导模型补充标点等风格）。
         chunk_duration_sec: 切片时长阈值（秒），超过则分片转录。
         file_size_limit_mb: 文件大小阈值（MB），超过则分片转录。
         device: 本地推理设备（'cuda'/'mps'/'cpu'），None 时自动选择。
@@ -95,7 +97,12 @@ def audio_to_text(
 
         if not needs_chunk:
             try:
-                text = recognizer.transcribe_file(path, language=language)
+                text = _transcribe_with_optional_prompt(
+                    recognizer,
+                    path,
+                    language=language,
+                    prompt=transcription_prompt,
+                )
                 # 即使不分片，也触发回调（作为单个完整切片）
                 if progress_callback:
                     progress_callback(1, 1, text, 0, audio.duration_seconds)
@@ -131,7 +138,12 @@ def audio_to_text(
                 temp_path = Path(tmp_file.name)
             try:
                 segment.export(temp_path, format=chunk_format, **export_kwargs)
-                chunk_text = recognizer.transcribe_file(temp_path, language=language)
+                chunk_text = _transcribe_with_optional_prompt(
+                    recognizer,
+                    temp_path,
+                    language=language,
+                    prompt=transcription_prompt,
+                )
             finally:
                 temp_path.unlink(missing_ok=True)
 
@@ -157,6 +169,24 @@ def _split_audio(audio: AudioSegment, chunk_duration_sec: int) -> List[AudioSegm
         audio[start:start + chunk_ms]
         for start in range(0, total_ms, chunk_ms)
     ]
+
+
+def _transcribe_with_optional_prompt(
+    recognizer: Any,
+    file_path: Path,
+    *,
+    language: Optional[str],
+    prompt: Optional[str],
+) -> str:
+    if prompt is None:
+        return recognizer.transcribe_file(file_path, language=language)
+
+    try:
+        return recognizer.transcribe_file(file_path, language=language, prompt=prompt)
+    except TypeError as exc:
+        if "prompt" not in str(exc):
+            raise
+        return recognizer.transcribe_file(file_path, language=language)
 
 
 def _resolve_chunk_export(provider: str) -> tuple[str, str, Dict[str, str]]:

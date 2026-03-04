@@ -49,7 +49,7 @@ def main() -> None:
 
     back_col, refresh_col, _ = st.columns([1, 1, 6], vertical_alignment="top")
     with back_col:
-        if st.button("⬅️ 返回工作台", type="primary", use_container_width=True):
+        if st.button("← 返回工作台", use_container_width=True):
             st.switch_page("app.py")
     with refresh_col:
         if st.button("🔄 刷新", use_container_width=True, key="refresh_history"):
@@ -74,7 +74,7 @@ def main() -> None:
     if not tasks:
         keyword = str(st.session_state.history_search_keyword).strip()
         if keyword:
-            st.info(f"未找到标题包含“{keyword}”的记录。")
+            st.info(f'未找到标题包含"{keyword}"的记录。')
         else:
             st.info("暂无历史任务。")
         return
@@ -97,25 +97,18 @@ def _ensure_pagination_state() -> None:
 
 
 def _render_search_bar() -> None:
-    search_col, action_col, clear_col = st.columns([6, 1, 1], vertical_alignment="bottom")
+    search_col, _ = st.columns([3, 5], vertical_alignment="bottom")
     with search_col:
         st.text_input(
             "搜索标题",
             key="history_search_input",
-            placeholder="输入关键词匹配视频标题，回车可直接搜索",
+            placeholder="搜索视频标题...",
             on_change=_apply_search_keyword,
         )
-    with action_col:
-        if st.button("🔍 搜索", use_container_width=True, key="history_search_btn"):
-            _apply_search_keyword()
-    with clear_col:
-        has_search = bool(st.session_state.history_search_keyword or st.session_state.history_search_input)
-        if st.button("清空", use_container_width=True, key="history_clear_search_btn", disabled=not has_search):
-            _clear_search_keyword()
 
     active_keyword = str(st.session_state.history_search_keyword).strip()
     if active_keyword:
-        st.caption(f"当前筛选：标题包含“{active_keyword}”")
+        st.caption(f'当前筛选：标题包含"{active_keyword}"')
 
 
 def _apply_search_keyword() -> None:
@@ -173,7 +166,7 @@ def _render_history_table(tasks: list[Task]) -> None:
         "<thead>"
         "<tr>"
         '<th class="title-col">视频标题</th>'
-        "<th>原链接/BV号</th>"
+        "<th>原链接</th>"
         "<th>处理时间</th>"
         "<th>任务状态</th>"
         '<th class="action-col">操作</th>'
@@ -241,10 +234,14 @@ def _build_task_row_html(task: Task) -> str:
 
     source_url = task.bilibili_url or ""
     safe_source_url = html.escape(source_url, quote=True)
-    safe_source_text = html.escape(_extract_link_label(source_url), quote=False)
+    bv_id = _extract_bv_id(source_url)
     source_cell_html = (
-        f'<a href="{safe_source_url}" target="_blank" rel="noopener noreferrer">{safe_source_text}</a>'
-        if source_url
+        f'<a href="{safe_source_url}" target="_blank" rel="noopener noreferrer" class="source-link" title="{bv_id}">'
+        f'<svg class="icon-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'
+        f'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>'
+        f'<path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>'
+        f'</svg><span class="bv-text">{html.escape(bv_id, quote=False)}</span></a>'
+        if source_url and bv_id != "-"
         else "<span>-</span>"
     )
 
@@ -264,12 +261,18 @@ def _build_task_row_html(task: Task) -> str:
           <td><span class="status-tag {status_class}">{safe_status_text}</span></td>
           <td class="action-col">
             <div class="action-group">
-              <a class="action-link" href="{detail_link}" target="_self">查看详情</a>
-              <a
-                class="action-link delete-link"
-                href="{delete_link}"
-                target="_self"
-              >删除</a>
+              <a class="action-icon view-icon" href="{detail_link}" target="_self" title="查看详情">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                  <circle cx="12" cy="12" r="3"></circle>
+                </svg>
+              </a>
+              <a class="action-icon delete-icon" href="{delete_link}" target="_self" title="删除">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+              </a>
             </div>
           </td>
         </tr>
@@ -278,13 +281,14 @@ def _build_task_row_html(task: Task) -> str:
     return row_html
 
 
-def _extract_link_label(source_url: str) -> str:
+def _extract_bv_id(source_url: str) -> str:
     if not source_url:
         return "-"
     matched = BV_PATTERN.search(source_url)
     if matched:
-        return matched.group(1).upper()
-    return "打开原视频"
+        bv = matched.group(1).upper()
+        return bv[:10] + "..." if len(bv) > 10 else bv
+    return "链接"
 
 
 def _format_created_at(raw_time: str) -> str:
@@ -421,15 +425,14 @@ def _inject_table_styles() -> None:
         """
         <style>
         .history-table-wrap {
-            border: 1px solid rgba(15, 23, 42, 0.12);
-            border-radius: 12px;
+            border: 1px solid rgba(15, 23, 42, 0.08);
             overflow: auto;
             max-height: 72vh;
             background: #ffffff;
         }
         .history-table {
             width: 100%;
-            min-width: 900px;
+            min-width: 800px;
             border-collapse: separate;
             border-spacing: 0;
             table-layout: fixed;
@@ -438,110 +441,136 @@ def _inject_table_styles() -> None:
             position: sticky;
             top: 0;
             z-index: 4;
-            padding: 12px 14px;
+            padding: 10px 12px;
             border-bottom: 1px solid #e5e7eb;
             background: #f8fafc;
             text-align: left;
-            font-size: 0.88rem;
-            font-weight: 600;
-            color: #334155;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: #64748b;
             white-space: nowrap;
         }
         .history-table td {
-            padding: 12px 14px;
-            border-bottom: 1px solid #eef2f7;
+            padding: 10px 12px;
+            border-bottom: 1px solid #f1f5f9;
             background: #ffffff;
             vertical-align: middle;
-            color: #111827;
-            font-size: 0.92rem;
+            color: #334155;
+            font-size: 0.9rem;
         }
-        .history-table tr:nth-child(even) td {
-            background: #fcfdff;
+        .history-table tr:hover td {
+            background: #f8fafc;
         }
         .history-table .title-col {
-            width: 42%;
+            width: 45%;
             max-width: 480px;
         }
         .history-table .title-text {
-            display: inline-block;
+            display: block;
             max-width: 100%;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            vertical-align: bottom;
         }
         .history-table .status-tag {
             display: inline-flex;
             align-items: center;
-            border-radius: 999px;
-            padding: 2px 10px;
-            border: 1px solid transparent;
-            font-size: 0.80rem;
-            font-weight: 600;
-            line-height: 1.4;
+            font-size: 0.85rem;
+            font-weight: 500;
         }
+        /* 成功状态：仅文字，无背景 */
         .history-table .status-success {
-            color: #047857;
-            background: #d1fae5;
-            border-color: #a7f3d0;
+            color: #10b981;
         }
         .history-table .status-failed {
-            color: #b91c1c;
-            background: #fee2e2;
-            border-color: #fecaca;
+            color: #ef4444;
+            background: #fef2f2;
+            padding: 2px 8px;
+            border-radius: 4px;
         }
         .history-table .status-running {
-            color: #1d4ed8;
-            background: #dbeafe;
-            border-color: #bfdbfe;
+            color: #3b82f6;
+            background: #eff6ff;
+            padding: 2px 8px;
+            border-radius: 4px;
         }
         .history-table .status-waiting {
-            color: #92400e;
-            background: #fef3c7;
-            border-color: #fde68a;
+            color: #f59e0b;
+            background: #fffbeb;
+            padding: 2px 8px;
+            border-radius: 4px;
         }
         .history-table .status-default {
-            color: #374151;
-            background: #f3f4f6;
-            border-color: #e5e7eb;
+            color: #6b7280;
         }
         .history-table .action-col {
             position: sticky;
             right: 0;
             z-index: 3;
-            min-width: 140px;
-            width: 140px;
-            text-align: right;
-            box-shadow: -1px 0 0 rgba(15, 23, 42, 0.08);
+            min-width: 80px;
+            width: 80px;
+            text-align: center;
             background: #ffffff;
         }
-        .history-table tr:nth-child(even) .action-col {
-            background: #fcfdff;
+        .history-table tr:hover .action-col {
+            background: #f8fafc;
         }
         .history-table th.action-col {
             z-index: 5;
             background: #f8fafc;
         }
-        .history-table .action-link {
-            color: #2563eb;
-            text-decoration: none;
-            font-weight: 600;
-            display: inline-flex;
-            align-items: center;
-            line-height: 1.25;
-        }
-        .history-table .action-link:hover {
-            text-decoration: underline;
-        }
+        /* 图标按钮样式 */
         .history-table .action-group {
             display: inline-flex;
             align-items: center;
-            gap: 10px;
-            justify-content: flex-end;
-            width: 100%;
+            gap: 8px;
+            justify-content: center;
         }
-        .history-table .delete-link {
-            color: #dc2626;
+        .history-table .action-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border-radius: 4px;
+            color: #64748b;
+            text-decoration: none;
+            transition: all 0.15s ease;
+        }
+        .history-table .action-icon:hover {
+            background: #e2e8f0;
+        }
+        .history-table .action-icon svg {
+            width: 16px;
+            height: 16px;
+        }
+        .history-table .view-icon:hover {
+            color: #3b82f6;
+            background: #eff6ff;
+        }
+        .history-table .delete-icon:hover {
+            color: #ef4444;
+            background: #fef2f2;
+        }
+        /* 链接样式 */
+        .history-table .source-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            color: #3b82f6;
+            text-decoration: none;
+            font-size: 0.85rem;
+        }
+        .history-table .source-link:hover {
+            text-decoration: underline;
+        }
+        .history-table .icon-link {
+            width: 14px;
+            height: 14px;
+        }
+        .history-table .bv-text {
+            font-family: monospace;
+            font-size: 0.8rem;
         }
         </style>
         """,

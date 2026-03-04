@@ -22,6 +22,7 @@ import config as app_config
 from utils.network import get_lan_addresses
 from utils.url_helper import process_user_input
 from core.downloader import download_audio
+from core.punctuator import punctuate_transcript
 from core import summarizer as summarizer_module
 from core.transcriber import audio_to_text
 from db.database import (
@@ -33,6 +34,7 @@ from db.database import (
     delete_tasks_before,
     delete_tasks_by_status,
     get_task,
+    get_task_raw_transcript,
     get_task_summary,
     get_task_transcript,
     get_transcription_progress,
@@ -93,6 +95,10 @@ TASK_TEXT_CACHE_SESSION_KEY = "task_text_cache"
 TRANSCRIBE_PROVIDER = DEFAULT_ASR_PROVIDER
 TRANSCRIBE_API_MODEL = DEFAULT_GROQ_ASR_MODEL
 TRANSCRIBE_LOCAL_MODEL_SIZE = "medium"
+TRANSCRIBE_TEXT_PROMPT = (
+    "请输出简体中文逐字稿，并尽量补全自然中文标点符号；"
+    "不要添加任何解释或额外内容。"
+)
 
 
 def _load_default_prompt() -> str:
@@ -107,6 +113,13 @@ def _load_default_prompt() -> str:
 
 
 _DEFAULT_PROMPT = _load_default_prompt()
+
+
+def _build_readable_transcript(raw_transcript: str) -> str:
+    """基于原始转录生成阅读版文本（自动补标点，不改字词）。"""
+    if not raw_transcript:
+        return ""
+    return punctuate_transcript(raw_transcript)
 
 
 def main() -> None:
@@ -227,27 +240,41 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
                 end_sec=end_sec,
             )
 
-        transcript = audio_to_text(
+        raw_transcript = audio_to_text(
             audio_path,
             provider=TRANSCRIBE_PROVIDER,
             asr_model=TRANSCRIBE_API_MODEL,
             model_size=TRANSCRIBE_LOCAL_MODEL_SIZE,
             language="zh",
+            transcription_prompt=TRANSCRIBE_TEXT_PROMPT,
             progress_callback=on_chunk_completed,
             resume_from_chunks=resume_chunks,
         )
-        update_task_content(task_id, transcript_text=transcript)
+        transcript = _build_readable_transcript(raw_transcript)
+        update_task_content(
+            task_id,
+            transcript_text=transcript,
+            transcript_raw_text=raw_transcript,
+        )
 
         update_task_status(task_id, TaskStatus.SUMMARIZING.value)
-        summary = summarizer_module.generate_summary(transcript, system_prompt=system_prompt)
+        summary = summarizer_module.generate_summary(
+            transcript or raw_transcript,
+            system_prompt=system_prompt,
+        )
         update_task_content(task_id, summary_text=summary)
 
         update_task_status(task_id, TaskStatus.COMPLETED.value)
     except Exception as exc:  # noqa: BLE001
         try:
-            partial_transcript = assemble_partial_transcript(task_id)
-            if partial_transcript:
-                update_task_content(task_id, transcript_text=partial_transcript)
+            partial_raw_transcript = assemble_partial_transcript(task_id)
+            if partial_raw_transcript:
+                partial_transcript = _build_readable_transcript(partial_raw_transcript)
+                update_task_content(
+                    task_id,
+                    transcript_text=partial_transcript,
+                    transcript_raw_text=partial_raw_transcript,
+                )
         except Exception:  # noqa: BLE001
             pass
         _mark_task_failed_safely(task_id, str(exc))
@@ -372,10 +399,15 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
             with st.spinner("正在加载转录文本..."):
                 _load_transcript_to_cache(task.id)
             transcript_text = _get_cached_task_text(task.id, "transcript") or ""
+        raw_transcript_text = _get_cached_task_text(task.id, "raw_transcript")
+        if raw_transcript_text is None:
+            with st.spinner("正在加载原始转录..."):
+                _load_raw_transcript_to_cache(task.id)
+            raw_transcript_text = _get_cached_task_text(task.id, "raw_transcript") or ""
 
         transcript_header_col, transcript_action_col = st.columns([5, 1], vertical_alignment="bottom")
         with transcript_header_col:
-            st.markdown("#### 完整转录")
+            st.markdown("#### 完整转录（阅读版）")
         with transcript_action_col:
             if transcript_text:
                 st.download_button(
@@ -392,6 +424,17 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
             _render_transcript_reader(transcript_text)
             transcript_copy_button_html = create_task_copy_button(task.id, transcript_text)
             components.html(transcript_copy_button_html, height=90, scrolling=False)
+            if raw_transcript_text and raw_transcript_text != transcript_text:
+                with st.expander("查看原始转录（未补标点）", expanded=False):
+                    st.download_button(
+                        label="下载原始 TXT",
+                        data=raw_transcript_text,
+                        file_name=f"task_{task.id}_transcript_raw.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                        key=f"download_transcript_raw_{task.id}",
+                    )
+                    _render_transcript_reader(raw_transcript_text)
         else:
             st.info("暂无转录文本。")
 
@@ -613,6 +656,12 @@ def _load_transcript_to_cache(task_id: int) -> None:
     """从数据库按需读取转录并写入缓存。"""
     transcript_text = get_task_transcript(task_id) or ""
     _set_cached_task_text(task_id, "transcript", transcript_text)
+
+
+def _load_raw_transcript_to_cache(task_id: int) -> None:
+    """从数据库按需读取原始转录并写入缓存。"""
+    raw_transcript_text = get_task_raw_transcript(task_id) or ""
+    _set_cached_task_text(task_id, "raw_transcript", raw_transcript_text)
 
 
 def _inject_reading_experience_styles() -> None:
@@ -883,7 +932,9 @@ def _refresh_title(task_id: int, url: str) -> None:
 def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
     """使用已存转录重新生成总结，可指定模型。"""
     transcript_text = task.transcript_text or get_task_transcript(task.id)
-    if not transcript_text:
+    raw_transcript_text = get_task_raw_transcript(task.id)
+    summary_source_text = transcript_text or raw_transcript_text
+    if not summary_source_text:
         _set_regen_feedback(task.id, "error", "暂无转录文本，无法生成总结")
         st.session_state["show_regen_dialog"] = False
         st.session_state["regen_task_id"] = None
@@ -900,7 +951,7 @@ def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
             update_task_status(task.id, TaskStatus.SUMMARIZING.value)
             status_box.write(f"已提交模型：{chosen_model}")
             summary = summarizer_module.generate_summary(
-                transcript_text,
+                summary_source_text,
                 system_prompt=_get_active_prompt(),
                 model=chosen_model,
             )
@@ -960,6 +1011,7 @@ def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
             if restart_from_scratch:
                 reset_transcription_data(task.id)
                 _set_cached_task_text(task.id, "transcript", "")
+                _set_cached_task_text(task.id, "raw_transcript", "")
                 _set_cached_task_text(task.id, "summary", "")
                 status_box.info("已清空历史进度，将从第 1 个切片开始。")
             else:
@@ -994,22 +1046,32 @@ def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
                 )
 
             # 调用转写
-            transcript = audio_to_text(
+            raw_transcript = audio_to_text(
                 audio_path,
                 provider=TRANSCRIBE_PROVIDER,
                 asr_model=TRANSCRIBE_API_MODEL,
                 model_size=TRANSCRIBE_LOCAL_MODEL_SIZE,
                 language="zh",
+                transcription_prompt=TRANSCRIBE_TEXT_PROMPT,
                 progress_callback=on_chunk_completed,
                 resume_from_chunks=resume_chunks,
             )
-            update_task_content(task.id, transcript_text=transcript)
+            transcript = _build_readable_transcript(raw_transcript)
+            update_task_content(
+                task.id,
+                transcript_text=transcript,
+                transcript_raw_text=raw_transcript,
+            )
             _set_cached_task_text(task.id, "transcript", transcript)
+            _set_cached_task_text(task.id, "raw_transcript", raw_transcript)
 
             # 继续总结
             update_task_status(task.id, TaskStatus.SUMMARIZING.value)
             status_box.write("总结中（LLM）...")
-            summary = summarizer_module.generate_summary(transcript, system_prompt=_get_active_prompt())
+            summary = summarizer_module.generate_summary(
+                transcript or raw_transcript,
+                system_prompt=_get_active_prompt(),
+            )
             update_task_content(task.id, summary_text=summary)
             _set_cached_task_text(task.id, "summary", summary)
 
@@ -1018,10 +1080,16 @@ def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
             st.success(success_message)
         except Exception as exc:  # noqa: BLE001
             # 保存部分结果
-            partial_transcript = assemble_partial_transcript(task.id)
-            if partial_transcript:
-                update_task_content(task.id, transcript_text=partial_transcript)
+            partial_raw_transcript = assemble_partial_transcript(task.id)
+            if partial_raw_transcript:
+                partial_transcript = _build_readable_transcript(partial_raw_transcript)
+                update_task_content(
+                    task.id,
+                    transcript_text=partial_transcript,
+                    transcript_raw_text=partial_raw_transcript,
+                )
                 _set_cached_task_text(task.id, "transcript", partial_transcript)
+                _set_cached_task_text(task.id, "raw_transcript", partial_raw_transcript)
                 status_box.warning(f"转写部分完成（{len(partial_transcript)} 字符），但遇到错误")
 
             update_task_status(task.id, TaskStatus.FAILED.value)

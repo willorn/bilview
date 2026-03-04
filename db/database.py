@@ -267,6 +267,7 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
                     video_duration_seconds INTEGER,
                     audio_file_path TEXT,
                     transcript_text TEXT,
+                    transcript_raw_text TEXT,
                     summary_text TEXT,
                     status TEXT NOT NULL DEFAULT 'waiting',
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -349,6 +350,7 @@ def update_task_status(
 def update_task_content(
     task_id: int,
     transcript_text: Optional[str] = None,
+    transcript_raw_text: Optional[str] = None,
     summary_text: Optional[str] = None,
     audio_file_path: Optional[str] = None,
     video_title: Optional[str] = None,
@@ -361,6 +363,7 @@ def update_task_content(
     Args:
         task_id: 任务主键。
         transcript_text: 逐字稿文本。
+        transcript_raw_text: 原始逐字稿文本（未补标点）。
         summary_text: 总结文本。
         audio_file_path: 音频文件相对路径。
         video_title: 视频标题（可更新）。
@@ -370,6 +373,8 @@ def update_task_content(
     fields: Dict[str, Any] = {}
     if transcript_text is not None:
         fields["transcript_text"] = transcript_text
+    if transcript_raw_text is not None:
+        fields["transcript_raw_text"] = transcript_raw_text
     if summary_text is not None:
         fields["summary_text"] = summary_text
     if audio_file_path is not None:
@@ -378,7 +383,17 @@ def update_task_content(
         fields["video_title"] = video_title
     if video_duration_seconds is not None:
         fields["video_duration_seconds"] = video_duration_seconds
-    _update_fields(task_id, fields, db_path)
+    try:
+        _update_fields(task_id, fields, db_path)
+    except Exception as exc:  # noqa: BLE001
+        if "transcript_raw_text" not in fields:
+            raise
+        if "transcript_raw_text" not in str(exc):
+            raise
+        fallback_fields = dict(fields)
+        fallback_fields.pop("transcript_raw_text", None)
+        if fallback_fields:
+            _update_fields(task_id, fallback_fields, db_path)
 
 
 def get_task(
@@ -442,6 +457,24 @@ def get_task_transcript(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> 
         if not row:
             return None
         return row[0] if _is_sequence_row(row) else row["transcript_text"]
+
+
+def get_task_raw_transcript(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> Optional[str]:
+    """按任务 ID 读取原始转录文本（未补标点）。"""
+    with get_connection(db_path) as connection:
+        try:
+            cursor = connection.execute(
+                "SELECT transcript_raw_text FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+        except Exception as exc:  # noqa: BLE001
+            if "transcript_raw_text" in str(exc):
+                return None
+            raise
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return row[0] if _is_sequence_row(row) else row["transcript_raw_text"]
 
 
 def list_tasks(
@@ -776,8 +809,8 @@ def _update_fields(
         "video_title",
         "audio_file_path",
         "transcript_text",
+        "transcript_raw_text",
         "summary_text",
-        "video_title",
         "video_duration_seconds",
         "status",
     }
@@ -828,6 +861,7 @@ def _is_local_replica_schema_ready() -> bool:
         "video_duration_seconds",
         "audio_file_path",
         "transcript_text",
+        "transcript_raw_text",
         "summary_text",
         "status",
         "created_at",
@@ -1040,6 +1074,8 @@ def _ensure_extra_columns(connection: Any) -> None:
     existing = {_table_info_name(row) for row in cursor.fetchall()}
     if "video_duration_seconds" not in existing:
         connection.execute("ALTER TABLE tasks ADD COLUMN video_duration_seconds INTEGER;")
+    if "transcript_raw_text" not in existing:
+        connection.execute("ALTER TABLE tasks ADD COLUMN transcript_raw_text TEXT;")
     _ensure_transcription_columns(connection)
 
 
@@ -1175,18 +1211,35 @@ def reset_transcription_data(
         db_path: 数据库文件路径。
     """
     with get_connection(db_path) as connection:
-        connection.execute(
-            """
-            UPDATE tasks
-            SET transcript_text = NULL,
-                summary_text = NULL,
-                transcription_progress = NULL,
-                transcription_total_chunks = NULL,
-                transcription_completed_chunks = NULL
-            WHERE id = ?
-            """,
-            (task_id,),
-        )
+        try:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET transcript_text = NULL,
+                    transcript_raw_text = NULL,
+                    summary_text = NULL,
+                    transcription_progress = NULL,
+                    transcription_total_chunks = NULL,
+                    transcription_completed_chunks = NULL
+                WHERE id = ?
+                """,
+                (task_id,),
+            )
+        except Exception as exc:  # noqa: BLE001
+            if "transcript_raw_text" not in str(exc):
+                raise
+            connection.execute(
+                """
+                UPDATE tasks
+                SET transcript_text = NULL,
+                    summary_text = NULL,
+                    transcription_progress = NULL,
+                    transcription_total_chunks = NULL,
+                    transcription_completed_chunks = NULL
+                WHERE id = ?
+                """,
+                (task_id,),
+            )
         _commit_connection(connection, sync_remote=True)
 
 
