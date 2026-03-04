@@ -56,6 +56,16 @@ def create_copy_button_with_tooltip(
     escaped_button_color = json.dumps(button_color)
     escaped_button_hover_color = json.dumps(button_hover_color)
 
+    # 判断是否使用超链接样式（透明背景 + 蓝色文字）
+    is_link_style = button_color == "transparent"
+    text_color = "#2563eb" if is_link_style else "white"
+    bg_color = "transparent"
+    border_style = "none"
+    padding_y = "0.25rem" if is_link_style else "0.5rem"
+    font_size = "0.875rem" if is_link_style else "1rem"
+    text_decoration = "none"
+    hover_decoration = "underline"
+
     markup = f"""
     <div style="width: 100%; position: relative; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
         <button
@@ -63,18 +73,19 @@ def create_copy_button_with_tooltip(
             id="copyBtn_{safe_id}"
             style="
                 width: 100%;
-                padding: 0.5rem 1rem;
-                background-color: {button_color};
-                color: white;
-                border: none;
-                border-radius: 0.5rem;
+                padding: {padding_y} 0.5rem;
+                background-color: {bg_color};
+                color: {text_color};
+                border: {border_style};
+                border-radius: 0.25rem;
                 cursor: pointer;
-                font-size: 1rem;
+                font-size: {font_size};
                 font-weight: 500;
-                transition: background-color 0.2s;
+                text-decoration: {text_decoration};
+                transition: all 0.2s;
             "
-            onmouseover="this.style.backgroundColor={escaped_button_hover_color}"
-            onmouseout="this.style.backgroundColor={escaped_button_color}">
+            onmouseover="this.style.textDecoration='{hover_decoration}'"
+            onmouseout="this.style.textDecoration='{text_decoration}'">
             {escaped_button_text}
         </button>
         <div
@@ -130,12 +141,14 @@ def create_copy_button_with_tooltip(
             }}
 
             button.textContent = '✓ 已复制';
-            button.style.backgroundColor = '#0e7c3a';
+            button.style.color = '#0e7c3a';
+            button.style.backgroundColor = 'transparent';
             showTooltip({escaped_success_message}, '#0e7c3a', {success_duration});
 
             setTimeout(function() {{
                 button.textContent = originalText;
-                button.style.backgroundColor = {escaped_button_color};
+                button.style.color = '{text_color}';
+                button.style.backgroundColor = '{bg_color}';
             }}, {success_duration});
         }} catch (err) {{
             console.error('复制失败:', err);

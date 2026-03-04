@@ -38,6 +38,17 @@ def create_download_button(
     safe_mime = json.dumps(mime)
     safe_label = html.escape(label)
 
+    # 判断是否使用超链接样式（透明背景 + 蓝色文字）
+    is_link_style = button_color == "transparent"
+    text_color = "#2563eb" if is_link_style else "white"
+    bg_color = "transparent"
+    border_style = "none"
+    padding_y = "0.25rem" if is_link_style else "0.55rem"
+    font_size = "0.875rem" if is_link_style else "1rem"
+    font_weight = "500"
+    text_decoration = "none"
+    hover_decoration = "underline"
+
     return f"""
     <div style="width: 100%;">
       <button
@@ -45,18 +56,19 @@ def create_download_button(
         onclick="downloadFile_{button_id}()"
         style="
           width: 100%;
-          padding: 0.55rem 1rem;
-          background-color: {button_color};
-          color: white;
-          border: none;
-          border-radius: 0.5rem;
+          padding: {padding_y} 0.5rem;
+          background-color: {bg_color};
+          color: {text_color};
+          border: {border_style};
+          border-radius: 0.25rem;
           cursor: pointer;
-          font-size: 1rem;
-          font-weight: 600;
-          transition: background-color 0.2s;
+          font-size: {font_size};
+          font-weight: {font_weight};
+          text-decoration: {text_decoration};
+          transition: all 0.2s;
         "
-        onmouseover="this.style.backgroundColor='{button_hover_color}'"
-        onmouseout="this.style.backgroundColor='{button_color}'">
+        onmouseover="this.style.textDecoration='{hover_decoration}'"
+        onmouseout="this.style.textDecoration='{text_decoration}'">
         {safe_label}
       </button>
     </div>

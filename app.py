@@ -354,47 +354,82 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
     _render_regen_feedback(task.id)
 
     _inject_reading_experience_styles()
-    detail_view = st.radio(
-        "内容视图",
-        options=("核心总结", "完整转录"),
-        horizontal=True,
-        key=f"detail_view_{task.id}",
-    )
+    transcript_text = _get_cached_task_text(task.id, "transcript")
 
-    if detail_view == "核心总结":
+    # 使用 Tabs 选项卡样式替代 radio
+    summary_tab, transcript_tab = st.tabs(["📋 核心总结", "📝 完整转录"])
+
+    with summary_tab:
         summary_text = _get_cached_task_text(task.id, "summary")
         if summary_text is None:
             with st.spinner("正在加载总结内容..."):
                 _load_summary_to_cache(task.id)
             summary_text = _get_cached_task_text(task.id, "summary") or ""
 
-        summary_header_col, summary_action_col = st.columns([5, 1], vertical_alignment="bottom")
-        with summary_header_col:
+        # 标题栏和操作按钮：标题左侧，按钮靠右
+        header_col, action_col = st.columns([1, 0.28], vertical_alignment="center")
+        with header_col:
             st.markdown("#### 核心总结")
-        with summary_action_col:
+        with action_col:
             if summary_text:
-                st.download_button(
-                    label="下载 MD",
-                    data=summary_text,
-                    file_name=f"task_{task.id}_summary.md",
+                _render_action_buttons(
+                    task_id=task.id,
+                    text_content=summary_text,
+                    download_filename=f"task_{task.id}_summary.md",
+                    download_label="下载",
+                    copy_label="复制",
                     mime="text/markdown",
-                    type="primary",
-                    use_container_width=True,
-                    key=f"download_summary_{task.id}",
+                    key_prefix="summary",
                 )
 
         if summary_text:
-            st.markdown(summary_text)
-            summary_copy_button_html = create_task_copy_button(
-                task_id=task.id,
-                text_to_copy=summary_text,
-                button_text="复制总结",
-            )
-            components.html(summary_copy_button_html, height=90, scrolling=False)
+            # 使用带淡淡背景色的容器展示总结内容，与页面其他区域区分
+            summary_container = st.container()
+            with summary_container:
+                st.markdown(
+                    f"""
+                    <div style="
+                        background-color: #f8f9fa;
+                        border-left: 4px solid #4a90d9;
+                        padding: 1rem 1.25rem;
+                        border-radius: 0 0.5rem 0.5rem 0;
+                        margin: 0.5rem 0;
+                    ">
+                        {summary_text}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
         else:
             st.info("暂无总结内容。")
-    else:
-        transcript_text = _get_cached_task_text(task.id, "transcript")
+
+        # 显示生成/重新生成总结按钮（只要有转录内容就可以生成）
+        transcript_for_summary = transcript_text or _get_cached_task_text(task.id, "raw_transcript")
+        if transcript_for_summary:
+            regen_running = _is_regen_running(task.id)
+            if regen_running:
+                st.info("⏳ 正在生成总结，请勿重复点击。")
+
+            if task.status in {TaskStatus.SUMMARIZING.value, TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}:
+                regen_btn_label = "生成中..." if regen_running else ("重新生成总结" if summary_text else "生成总结")
+                if st.button(
+                    regen_btn_label,
+                    use_container_width=False,
+                    type="secondary",
+                    key=f"regen_{task.id}",
+                    disabled=regen_running,
+                ):
+                    if _allow_action(f"open_regen_dialog_{task.id}"):
+                        st.session_state["show_regen_dialog"] = True
+                        st.session_state["regen_task_id"] = task.id
+                        st.session_state.setdefault("regen_model_choice", SUMMARY_MODEL_OPTIONS[0][1])
+                    else:
+                        st.toast("点击过快，请稍后再试")
+
+            if st.session_state.get("show_regen_dialog") and st.session_state.get("regen_task_id") == task.id:
+                _render_regen_dialog(task)
+
+    with transcript_tab:
         if transcript_text is None:
             with st.spinner("正在加载转录文本..."):
                 _load_transcript_to_cache(task.id)
@@ -405,34 +440,34 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
                 _load_raw_transcript_to_cache(task.id)
             raw_transcript_text = _get_cached_task_text(task.id, "raw_transcript") or ""
 
-        transcript_header_col, transcript_action_col = st.columns([5, 1], vertical_alignment="bottom")
-        with transcript_header_col:
+        # 标题栏和操作按钮：标题左侧，按钮靠右
+        header_col, action_col = st.columns([1, 0.28], vertical_alignment="center")
+        with header_col:
             st.markdown("#### 完整转录（阅读版）")
-        with transcript_action_col:
+        with action_col:
             if transcript_text:
-                st.download_button(
-                    label="下载 TXT",
-                    data=transcript_text,
-                    file_name=f"task_{task.id}_transcript.txt",
+                _render_action_buttons(
+                    task_id=task.id,
+                    text_content=transcript_text,
+                    download_filename=f"task_{task.id}_transcript.txt",
+                    download_label="下载",
+                    copy_label="复制",
                     mime="text/plain",
-                    type="primary",
-                    use_container_width=True,
-                    key=f"download_transcript_{task.id}",
+                    key_prefix="transcript",
                 )
 
         if transcript_text:
             _render_transcript_reader(transcript_text)
-            transcript_copy_button_html = create_task_copy_button(task.id, transcript_text)
-            components.html(transcript_copy_button_html, height=90, scrolling=False)
             if raw_transcript_text and raw_transcript_text != transcript_text:
                 with st.expander("查看原始转录（未补标点）", expanded=False):
-                    st.download_button(
-                        label="下载原始 TXT",
-                        data=raw_transcript_text,
-                        file_name=f"task_{task.id}_transcript_raw.txt",
+                    _render_action_buttons(
+                        task_id=task.id,
+                        text_content=raw_transcript_text,
+                        download_filename=f"task_{task.id}_transcript_raw.txt",
+                        download_label="下载原始",
+                        copy_label="复制原始",
                         mime="text/plain",
-                        use_container_width=True,
-                        key=f"download_transcript_raw_{task.id}",
+                        key_prefix="transcript_raw",
                     )
                     _render_transcript_reader(raw_transcript_text)
         else:
@@ -472,29 +507,6 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
                 key=f"restart_{task.id}",
             ):
                 _restart_transcription(task)
-
-    regen_running = _is_regen_running(task.id)
-    if regen_running:
-        st.info("⏳ 正在重新生成总结，请勿重复点击。")
-
-    if task.status in {TaskStatus.SUMMARIZING.value, TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}:
-        regen_btn_label = "重新生成中..." if regen_running else "重新生成总结"
-        if st.button(
-            regen_btn_label,
-            use_container_width=True,
-            type="primary",
-            key=f"regen_{task.id}",
-            disabled=regen_running,
-        ):
-            if _allow_action(f"open_regen_dialog_{task.id}"):
-                st.session_state["show_regen_dialog"] = True
-                st.session_state["regen_task_id"] = task.id
-                st.session_state.setdefault("regen_model_choice", SUMMARY_MODEL_OPTIONS[0][1])
-            else:
-                st.toast("点击过快，请稍后再试")
-
-    if st.session_state.get("show_regen_dialog") and st.session_state.get("regen_task_id") == task.id:
-        _render_regen_dialog(task)
 
 
 def _render_top_actions() -> None:
@@ -573,6 +585,45 @@ def _is_regen_running(task_id: int) -> bool:
         return int(st.session_state.get(REGEN_RUNNING_TASK_SESSION_KEY, 0)) == int(task_id)
     except (TypeError, ValueError):
         return False
+
+
+def _render_action_buttons(
+    task_id: int,
+    text_content: str,
+    download_filename: str,
+    download_label: str = "下载",
+    copy_label: str = "复制",
+    mime: str = "text/plain",
+    key_prefix: str = "action",
+) -> None:
+    """渲染并排的复制和下载超链接样式按钮，靠右对齐，中间间隔5像素。"""
+    # 按钮列宽刚好容纳两个汉字，中间5像素间隔
+    copy_col, download_col = st.columns([0.12, 0.12], gap="small")
+
+    with copy_col:
+        copy_button_html = create_copy_button_with_tooltip(
+            button_id=f"{key_prefix}_{task_id}",
+            text_to_copy=text_content,
+            button_text=copy_label,
+            button_color="transparent",
+            button_hover_color="#f0f0f0",
+            success_message="✓ 已复制",
+            error_message="✗ 复制失败",
+        )
+        components.html(copy_button_html, height=36, scrolling=False)
+
+    with download_col:
+        from utils.download_button import create_download_button
+        download_button_html = create_download_button(
+            button_id=f"{key_prefix}_{task_id}",
+            content=text_content,
+            filename=download_filename,
+            label=download_label,
+            mime=mime,
+            button_color="transparent",
+            button_hover_color="#f0f0f0",
+        )
+        components.html(download_button_html, height=36, scrolling=False)
 
 
 def _allow_action(action_name: str, cooldown_seconds: float = REGEN_ACTION_DEBOUNCE_SECONDS) -> bool:
@@ -695,6 +746,17 @@ def _inject_reading_experience_styles() -> None:
         }
         .transcript-reader::-webkit-scrollbar-track {
             background: transparent;
+        }
+        /* 移动端适配 */
+        @media (max-width: 768px) {
+            .transcript-reader {
+                max-height: 400px;
+                padding: 0.75rem;
+            }
+            .transcript-reader pre {
+                font-size: 0.9375rem;
+                line-height: 1.5;
+            }
         }
         </style>
         """,
