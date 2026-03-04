@@ -383,23 +383,7 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
                 )
 
         if summary_text:
-            # 使用带淡淡背景色的容器展示总结内容，与页面其他区域区分
-            summary_container = st.container()
-            with summary_container:
-                st.markdown(
-                    f"""
-                    <div style="
-                        background-color: #f8f9fa;
-                        border-left: 4px solid #4a90d9;
-                        padding: 1rem 1.25rem;
-                        border-radius: 0 0.5rem 0.5rem 0;
-                        margin: 0.5rem 0;
-                    ">
-                        {summary_text}
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
+            st.markdown(summary_text)
         else:
             st.info("暂无总结内容。")
 
