@@ -58,6 +58,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def get_api_key(env_name: str, default: Optional[str] = None) -> Optional[str]:
     """通用读取 API Key 的函数。"""
     return os.getenv(env_name, default)
@@ -101,6 +111,8 @@ DEFAULT_GROQ_ASR_BASE_URL = (
 )
 DEFAULT_GROQ_ASR_MODEL = os.getenv("GROQ_ASR_MODEL", "whisper-large-v3-turbo").strip() or "whisper-large-v3-turbo"
 ASR_REQUEST_TIMEOUT_SECONDS = _env_int("ASR_REQUEST_TIMEOUT_SECONDS", default=120)
+TASK_EXECUTOR_MAX_WORKERS = _env_int("TASK_EXECUTOR_MAX_WORKERS", default=1)
+TASK_EXECUTOR_POLL_INTERVAL_SECONDS = _env_float("TASK_EXECUTOR_POLL_INTERVAL_SECONDS", default=1.0)
 
 
 def ensure_api_key_present() -> None:

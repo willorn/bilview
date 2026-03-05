@@ -9,8 +9,10 @@ Streamlit 前端：负责输入、状态提示、历史记录与结果展示。
 from __future__ import annotations
 
 import html
+import logging
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -30,6 +32,7 @@ from db.database import (
     Task,
     TaskStatus,
     assemble_partial_transcript,
+    claim_next_waiting_task,
     create_task,
     delete_tasks_before,
     delete_tasks_by_status,
@@ -40,6 +43,7 @@ from db.database import (
     get_transcription_progress,
     init_db,
     list_tasks,
+    recover_interrupted_tasks,
     reset_transcription_data,
     update_task_content,
     update_task_status,
@@ -99,6 +103,138 @@ TRANSCRIBE_TEXT_PROMPT = (
     "请输出简体中文逐字稿，并尽量补全自然中文标点符号；"
     "不要添加任何解释或额外内容。"
 )
+LOGGER = logging.getLogger(__name__)
+_TASK_PROMPT_SNAPSHOTS: dict[int, Optional[str]] = {}
+_TASK_PROMPT_SNAPSHOTS_LOCK = threading.Lock()
+
+
+def _read_positive_int_config(name: str, default: int) -> int:
+    raw_value = getattr(app_config, name, default)
+    try:
+        return max(int(raw_value), 1)
+    except (TypeError, ValueError):
+        return max(int(default), 1)
+
+
+def _read_positive_float_config(name: str, default: float) -> float:
+    raw_value = getattr(app_config, name, default)
+    try:
+        return max(float(raw_value), 0.2)
+    except (TypeError, ValueError):
+        return max(float(default), 0.2)
+
+
+TASK_EXECUTOR_MAX_WORKERS = _read_positive_int_config("TASK_EXECUTOR_MAX_WORKERS", 1)
+TASK_EXECUTOR_POLL_INTERVAL_SECONDS = _read_positive_float_config("TASK_EXECUTOR_POLL_INTERVAL_SECONDS", 1.0)
+
+
+def _remember_task_prompt(task_id: int, prompt: Optional[str]) -> None:
+    with _TASK_PROMPT_SNAPSHOTS_LOCK:
+        _TASK_PROMPT_SNAPSHOTS[int(task_id)] = prompt
+
+
+def _take_task_prompt(task_id: int) -> Optional[str]:
+    with _TASK_PROMPT_SNAPSHOTS_LOCK:
+        return _TASK_PROMPT_SNAPSHOTS.pop(int(task_id), None)
+
+
+class _PersistentTaskExecutor:
+    """基于数据库 waiting 状态的持久化任务执行器。"""
+
+    def __init__(self, max_workers: int, poll_interval_seconds: float) -> None:
+        self._max_workers = max(1, int(max_workers))
+        self._poll_interval_seconds = max(float(poll_interval_seconds), 0.2)
+        self._pool = ThreadPoolExecutor(
+            max_workers=self._max_workers,
+            thread_name_prefix="task-worker",
+        )
+        self._futures: set[Future[Any]] = set()
+        self._futures_lock = threading.Lock()
+        self._dispatch_thread: Optional[threading.Thread] = None
+        self._dispatch_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._recovered_once = False
+
+    def start(self) -> None:
+        with self._dispatch_lock:
+            if self._dispatch_thread and self._dispatch_thread.is_alive():
+                return
+
+            if not self._recovered_once:
+                self._recover_interrupted_tasks_once()
+                self._recovered_once = True
+
+            self._stop_event.clear()
+            self._dispatch_thread = threading.Thread(
+                target=self._dispatch_loop,
+                name="task-dispatcher",
+                daemon=True,
+            )
+            self._dispatch_thread.start()
+
+    def notify_new_task(self) -> None:
+        self.start()
+        self._wake_event.set()
+
+    def _recover_interrupted_tasks_once(self) -> None:
+        try:
+            recovered_count = recover_interrupted_tasks()
+            if recovered_count > 0:
+                LOGGER.info("任务执行器已接管 %s 个中断任务。", recovered_count)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("任务执行器恢复中断任务失败：%s", exc)
+
+    def _dispatch_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._prune_done_futures()
+            scheduled = self._schedule_waiting_tasks()
+            if scheduled:
+                continue
+            self._wake_event.wait(timeout=self._poll_interval_seconds)
+            self._wake_event.clear()
+
+    def _schedule_waiting_tasks(self) -> bool:
+        has_scheduled = False
+        while self._running_futures_count() < self._max_workers:
+            try:
+                queue_item = claim_next_waiting_task()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("认领 waiting 任务失败：%s", exc)
+                return has_scheduled
+
+            if not queue_item:
+                return has_scheduled
+
+            has_scheduled = True
+            prompt_snapshot = _take_task_prompt(queue_item.id)
+            future = self._pool.submit(
+                _process_task,
+                queue_item.id,
+                queue_item.bilibili_url,
+                prompt_snapshot,
+            )
+            with self._futures_lock:
+                self._futures.add(future)
+        return has_scheduled
+
+    def _prune_done_futures(self) -> None:
+        with self._futures_lock:
+            self._futures = {future for future in self._futures if not future.done()}
+
+    def _running_futures_count(self) -> int:
+        with self._futures_lock:
+            return len(self._futures)
+
+
+@st.cache_resource(show_spinner=False)
+def _get_task_executor() -> _PersistentTaskExecutor:
+    executor = _PersistentTaskExecutor(
+        max_workers=TASK_EXECUTOR_MAX_WORKERS,
+        poll_interval_seconds=TASK_EXECUTOR_POLL_INTERVAL_SECONDS,
+    )
+    executor.start()
+    return executor
 
 
 def _load_default_prompt() -> str:
@@ -138,6 +274,7 @@ def main() -> None:
     if not st.session_state.db_initialized and DB_AUTO_INIT_ON_STARTUP:
         _initialize_database(show_feedback=False)
     ensure_dir(DOWNLOAD_DIR)
+    _get_task_executor().start()
 
     if "running_task_id" not in st.session_state:
         st.session_state.running_task_id = None
@@ -191,19 +328,15 @@ def main() -> None:
 
 
 def _start_task(url: str, system_prompt: Optional[str]) -> int:
-    """创建任务并启动处理。"""
+    """创建任务并交给持久化执行器排队处理。"""
     task_id = create_task(bilibili_url=url, video_title="pending")
+    _remember_task_prompt(task_id, system_prompt)
     try:
-        worker = threading.Thread(
-            target=_process_task,
-            args=(task_id, url, system_prompt),
-            name=f"task-worker-{task_id}",
-            daemon=True,
-        )
-        worker.start()
+        _get_task_executor().notify_new_task()
     except Exception as exc:  # noqa: BLE001
-        _mark_task_failed_safely(task_id, f"启动任务失败：{exc}")
-        st.error(f"任务启动失败：{exc}")
+        _take_task_prompt(task_id)
+        _mark_task_failed_safely(task_id, f"提交任务到执行队列失败：{exc}")
+        st.error(f"任务提交失败：{exc}")
     return task_id
 
 
@@ -214,18 +347,43 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
     注意：这里不依赖 Streamlit UI 状态，避免浏览器断开导致任务中断。
     """
     try:
-        update_task_status(task_id, TaskStatus.DOWNLOADING.value)
-        audio_path, info = download_audio(url, download_dir=DOWNLOAD_DIR, return_info=True)
-        update_task_content(
-            task_id,
-            audio_file_path=str(audio_path),
-            video_title=info.get("title") if isinstance(info, dict) else None,
-            video_duration_seconds=int(info.get("duration")) if isinstance(info, dict) and info.get("duration") else None,
-        )
+        existing_task = get_task(task_id, include_content=False)
+        audio_path: Optional[Path] = None
+        if existing_task and existing_task.audio_file_path:
+            candidate_path = Path(existing_task.audio_file_path).expanduser().resolve()
+            if candidate_path.exists():
+                audio_path = candidate_path
+
+        if audio_path is None:
+            update_task_status(task_id, TaskStatus.DOWNLOADING.value)
+            audio_path, info = download_audio(url, download_dir=DOWNLOAD_DIR, return_info=True)
+            update_task_content(
+                task_id,
+                audio_file_path=str(audio_path),
+                video_title=info.get("title") if isinstance(info, dict) else None,
+                video_duration_seconds=int(info.get("duration")) if isinstance(info, dict) and info.get("duration") else None,
+            )
+
+        existing_progress = get_transcription_progress(task_id)
+        total_chunks = int(existing_progress.get("total_chunks", 0)) if existing_progress else 0
+        completed_chunks = int(existing_progress.get("completed_chunks", 0)) if existing_progress else 0
+        has_completed_transcription = total_chunks > 0 and completed_chunks >= total_chunks
+        if has_completed_transcription:
+            existing_transcript = get_task_transcript(task_id) or ""
+            existing_raw_transcript = get_task_raw_transcript(task_id) or ""
+            summary_source = existing_transcript or existing_raw_transcript
+            if summary_source:
+                update_task_status(task_id, TaskStatus.SUMMARIZING.value)
+                summary = summarizer_module.generate_summary(
+                    summary_source,
+                    system_prompt=system_prompt,
+                )
+                update_task_content(task_id, summary_text=summary)
+                update_task_status(task_id, TaskStatus.COMPLETED.value)
+                return
 
         update_task_status(task_id, TaskStatus.TRANSCRIBING.value)
 
-        existing_progress = get_transcription_progress(task_id)
         resume_chunks = None
         if existing_progress and existing_progress.get("completed_chunks", 0) > 0:
             resume_chunks = existing_progress["chunks"]

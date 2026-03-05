@@ -114,6 +114,14 @@ class Task:
 
 
 @dataclass(frozen=True)
+class TaskQueueItem:
+    """任务队列中的轻量任务描述。"""
+
+    id: int
+    bilibili_url: str
+
+
+@dataclass(frozen=True)
 class D1Credentials:
     """Cloudflare D1 连接所需凭据。"""
 
@@ -330,6 +338,81 @@ def create_task(
         )
         _commit_connection(connection, sync_remote=True)
         return int(cursor.lastrowid)
+
+
+def claim_next_waiting_task(
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> Optional[TaskQueueItem]:
+    """
+    原子认领一个 waiting 任务，并将其状态切换为 downloading。
+
+    Returns:
+        成功认领时返回 TaskQueueItem；队列为空或竞争失败时返回 None。
+    """
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            """
+            SELECT id, bilibili_url
+            FROM tasks
+            WHERE status = ?
+            ORDER BY datetime(created_at) ASC, id ASC
+            LIMIT 1
+            """,
+            (TaskStatus.WAITING.value,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        if _is_sequence_row(row):
+            task_id = int(row[0])
+            task_url = str(row[1])
+        else:
+            task_id = int(row["id"])
+            task_url = str(row["bilibili_url"])
+
+        update_cursor = connection.execute(
+            """
+            UPDATE tasks
+            SET status = ?
+            WHERE id = ? AND status = ?
+            """,
+            (TaskStatus.DOWNLOADING.value, task_id, TaskStatus.WAITING.value),
+        )
+        claimed_rows = int(getattr(update_cursor, "rowcount", 0) or 0)
+        if claimed_rows <= 0:
+            _commit_connection(connection, sync_remote=False)
+            return None
+
+        _commit_connection(connection, sync_remote=True)
+        return TaskQueueItem(id=task_id, bilibili_url=task_url)
+
+
+def recover_interrupted_tasks(
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> int:
+    """
+    启动时回收异常中断的任务：将中间态统一回退到 waiting。
+
+    Returns:
+        被回收的任务条数。
+    """
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE tasks
+            SET status = ?
+            WHERE status IN (?, ?, ?)
+            """,
+            (
+                TaskStatus.WAITING.value,
+                TaskStatus.DOWNLOADING.value,
+                TaskStatus.TRANSCRIBING.value,
+                TaskStatus.SUMMARIZING.value,
+            ),
+        )
+        _commit_connection(connection, sync_remote=True)
+        return int(getattr(cursor, "rowcount", 0) or 0)
 
 
 def update_task_status(
