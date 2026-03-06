@@ -269,10 +269,12 @@ def _format_status(status: str) -> str:
     status_map = {
         TaskStatus.COMPLETED.value: "成功",
         TaskStatus.FAILED.value: "失败",
+        TaskStatus.TIMEOUT.value: "超时",
         TaskStatus.WAITING.value: "等待",
         TaskStatus.DOWNLOADING.value: "下载",
         TaskStatus.TRANSCRIBING.value: "转录",
         TaskStatus.SUMMARIZING.value: "总结",
+        TaskStatus.CANCELLED.value: "取消",
     }
     return status_map.get(status, status)
 

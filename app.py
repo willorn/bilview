@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -32,20 +33,26 @@ from db.database import (
     Task,
     TaskStatus,
     assemble_partial_transcript,
+    clear_task_cancel_request,
+    clear_task_error,
     claim_next_waiting_task,
     create_task,
     delete_tasks_before,
     delete_tasks_by_status,
+    get_task_error_info,
     get_task,
     get_task_raw_transcript,
     get_task_summary,
     get_task_transcript,
     get_transcription_progress,
     init_db,
+    is_task_cancel_requested,
     list_tasks,
+    request_task_cancel,
     recover_interrupted_tasks,
     reset_transcription_data,
     update_task_content,
+    update_task_error,
     update_task_status,
     update_transcription_progress,
 )
@@ -83,6 +90,8 @@ STATUS_MAP = {
     TaskStatus.DOWNLOADING.value: "下载中",
     TaskStatus.TRANSCRIBING.value: "转录中",
     TaskStatus.SUMMARIZING.value: "总结中",
+    TaskStatus.TIMEOUT.value: "已超时",
+    TaskStatus.CANCELLED.value: "已取消",
     TaskStatus.COMPLETED.value: "已完成",
     TaskStatus.FAILED.value: "失败",
 }
@@ -96,6 +105,8 @@ REGEN_FEEDBACK_SESSION_KEY = "regen_feedback"
 REGEN_ACTION_DEBOUNCE_SECONDS = 1.2
 REGEN_RUNNING_TASK_SESSION_KEY = "regen_running_task_id"
 TASK_TEXT_CACHE_SESSION_KEY = "task_text_cache"
+DB_SCHEMA_READY_SESSION_KEY = "db_schema_ready"
+DB_SCHEMA_ERROR_SESSION_KEY = "db_schema_error"
 TRANSCRIBE_PROVIDER = DEFAULT_ASR_PROVIDER
 TRANSCRIBE_API_MODEL = DEFAULT_GROQ_ASR_MODEL
 TRANSCRIBE_LOCAL_MODEL_SIZE = "medium"
@@ -106,6 +117,8 @@ TRANSCRIBE_TEXT_PROMPT = (
 LOGGER = logging.getLogger(__name__)
 _TASK_PROMPT_SNAPSHOTS: dict[int, Optional[str]] = {}
 _TASK_PROMPT_SNAPSHOTS_LOCK = threading.Lock()
+_TASK_TIMEOUT_REQUESTS: set[int] = set()
+_TASK_TIMEOUT_REQUESTS_LOCK = threading.Lock()
 
 
 def _read_positive_int_config(name: str, default: int) -> int:
@@ -114,6 +127,14 @@ def _read_positive_int_config(name: str, default: int) -> int:
         return max(int(raw_value), 1)
     except (TypeError, ValueError):
         return max(int(default), 1)
+
+
+def _read_non_negative_int_config(name: str, default: int) -> int:
+    raw_value = getattr(app_config, name, default)
+    try:
+        return max(int(raw_value), 0)
+    except (TypeError, ValueError):
+        return max(int(default), 0)
 
 
 def _read_positive_float_config(name: str, default: float) -> float:
@@ -126,6 +147,11 @@ def _read_positive_float_config(name: str, default: float) -> float:
 
 TASK_EXECUTOR_MAX_WORKERS = _read_positive_int_config("TASK_EXECUTOR_MAX_WORKERS", 1)
 TASK_EXECUTOR_POLL_INTERVAL_SECONDS = _read_positive_float_config("TASK_EXECUTOR_POLL_INTERVAL_SECONDS", 1.0)
+TASK_EXECUTOR_TASK_TIMEOUT_SECONDS = _read_positive_float_config("TASK_EXECUTOR_TASK_TIMEOUT_SECONDS", 5400.0)
+TASK_EXECUTOR_TIMEOUT_OVERFLOW_WORKERS = _read_non_negative_int_config(
+    "TASK_EXECUTOR_TIMEOUT_OVERFLOW_WORKERS",
+    1,
+)
 
 
 def _remember_task_prompt(task_id: int, prompt: Optional[str]) -> None:
@@ -138,23 +164,129 @@ def _take_task_prompt(task_id: int) -> Optional[str]:
         return _TASK_PROMPT_SNAPSHOTS.pop(int(task_id), None)
 
 
+def _extract_error_code(error_text: str) -> str:
+    """从异常文本中提取机器可读错误码。"""
+    normalized = (error_text or "").strip()
+    if not normalized:
+        return "UNKNOWN"
+    lowered = normalized.lower()
+    if "超时" in normalized or "timeout" in lowered:
+        return "TASK_TIMEOUT"
+
+    http_match = re.search(r"\bHTTP\s+(\d{3})\b", normalized, flags=re.IGNORECASE)
+    if http_match:
+        return f"HTTP_{http_match.group(1)}"
+
+    status_match = re.search(r"\b(\d{3})\b", normalized)
+    if status_match and status_match.group(1) in {"401", "403", "404", "408", "409", "413", "429", "500", "502", "503", "504"}:
+        return f"HTTP_{status_match.group(1)}"
+
+    return "RUNTIME_ERROR"
+
+
+def _record_task_error(task_id: int, stage: str, error_text: str) -> None:
+    """将失败信息写入结构化错误字段。"""
+    try:
+        update_task_error(
+            task_id,
+            error_stage=stage,
+            error_code=_extract_error_code(error_text),
+            error_message=error_text,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("写入任务结构化错误失败(task=%s)：%s", task_id, exc)
+
+
+def _clear_task_error(task_id: int) -> None:
+    """清理任务错误信息，避免旧错误误导。"""
+    try:
+        clear_task_error(task_id)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("清理任务结构化错误失败(task=%s)：%s", task_id, exc)
+
+
+class TaskCancelledError(RuntimeError):
+    """任务被用户取消。"""
+
+    def __init__(self, message: str, reason: str = "user") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _mark_task_timeout_requested(task_id: int) -> None:
+    with _TASK_TIMEOUT_REQUESTS_LOCK:
+        _TASK_TIMEOUT_REQUESTS.add(int(task_id))
+
+
+def _is_task_timeout_requested(task_id: int) -> bool:
+    with _TASK_TIMEOUT_REQUESTS_LOCK:
+        return int(task_id) in _TASK_TIMEOUT_REQUESTS
+
+
+def _consume_task_timeout_requested(task_id: int) -> bool:
+    with _TASK_TIMEOUT_REQUESTS_LOCK:
+        key = int(task_id)
+        if key in _TASK_TIMEOUT_REQUESTS:
+            _TASK_TIMEOUT_REQUESTS.remove(key)
+            return True
+        return False
+
+
+def _clear_task_timeout_requested(task_id: int) -> None:
+    with _TASK_TIMEOUT_REQUESTS_LOCK:
+        _TASK_TIMEOUT_REQUESTS.discard(int(task_id))
+
+
+def _record_task_cancelled(task_id: int) -> None:
+    """记录任务取消信息。"""
+    try:
+        update_task_error(
+            task_id,
+            error_stage="cancelled",
+            error_code="USER_CANCELLED",
+            error_message="用户主动取消任务",
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("写入任务取消信息失败(task=%s)：%s", task_id, exc)
+
+
+def _raise_if_task_cancel_requested(task_id: int) -> None:
+    if is_task_cancel_requested(task_id):
+        if _is_task_timeout_requested(task_id):
+            raise TaskCancelledError("任务执行超时，已停止", reason="timeout")
+        raise TaskCancelledError("任务已被用户取消", reason="user")
+
+
 class _PersistentTaskExecutor:
     """基于数据库 waiting 状态的持久化任务执行器。"""
 
-    def __init__(self, max_workers: int, poll_interval_seconds: float) -> None:
+    def __init__(
+        self,
+        max_workers: int,
+        poll_interval_seconds: float,
+        task_timeout_seconds: float,
+        timeout_overflow_workers: int,
+    ) -> None:
         self._max_workers = max(1, int(max_workers))
         self._poll_interval_seconds = max(float(poll_interval_seconds), 0.2)
-        self._pool = ThreadPoolExecutor(
-            max_workers=self._max_workers,
-            thread_name_prefix="task-worker",
-        )
-        self._futures: set[Future[Any]] = set()
+        self._task_timeout_seconds = max(float(task_timeout_seconds), 30.0)
+        self._timeout_overflow_workers = max(int(timeout_overflow_workers), 0)
+        self._pool_generation = 1
+        self._pool = self._build_thread_pool()
+        self._futures: dict[Future[Any], tuple[int, float]] = {}
+        self._detached_futures: dict[Future[Any], int] = {}
         self._futures_lock = threading.Lock()
         self._dispatch_thread: Optional[threading.Thread] = None
         self._dispatch_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._recovered_once = False
+
+    def _build_thread_pool(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(
+            max_workers=self._max_workers,
+            thread_name_prefix=f"task-worker-g{self._pool_generation}",
+        )
 
     def start(self) -> None:
         with self._dispatch_lock:
@@ -188,6 +320,7 @@ class _PersistentTaskExecutor:
     def _dispatch_loop(self) -> None:
         while not self._stop_event.is_set():
             self._prune_done_futures()
+            self._enforce_task_timeouts()
             scheduled = self._schedule_waiting_tasks()
             if scheduled:
                 continue
@@ -196,7 +329,7 @@ class _PersistentTaskExecutor:
 
     def _schedule_waiting_tasks(self) -> bool:
         has_scheduled = False
-        while self._running_futures_count() < self._max_workers:
+        while self._has_available_worker_slot():
             try:
                 queue_item = claim_next_waiting_task()
             except Exception as exc:  # noqa: BLE001
@@ -215,16 +348,87 @@ class _PersistentTaskExecutor:
                 prompt_snapshot,
             )
             with self._futures_lock:
-                self._futures.add(future)
+                self._futures[future] = (queue_item.id, time.monotonic())
         return has_scheduled
 
     def _prune_done_futures(self) -> None:
         with self._futures_lock:
-            self._futures = {future for future in self._futures if not future.done()}
+            done_futures = [future for future in self._futures if future.done()]
+            for future in done_futures:
+                task_id, _ = self._futures.pop(future)
+                _consume_task_timeout_requested(task_id)
 
-    def _running_futures_count(self) -> int:
+            done_detached_futures = [
+                future for future in self._detached_futures if future.done()
+            ]
+            for future in done_detached_futures:
+                task_id = self._detached_futures.pop(future)
+                _consume_task_timeout_requested(task_id)
+
+    def _has_available_worker_slot(self) -> bool:
         with self._futures_lock:
-            return len(self._futures)
+            detached_count = len(self._detached_futures)
+            active_limit = max(
+                self._max_workers + self._timeout_overflow_workers - detached_count,
+                0,
+            )
+            return len(self._futures) < active_limit
+
+    def _enforce_task_timeouts(self) -> None:
+        timed_out_futures: list[tuple[Future[Any], int, float]] = []
+        with self._futures_lock:
+            for future, (task_id, start_ts) in self._futures.items():
+                elapsed = time.monotonic() - start_ts
+                if elapsed > self._task_timeout_seconds and not _is_task_timeout_requested(task_id):
+                    timed_out_futures.append((future, task_id, elapsed))
+
+        detached_task_ids: list[int] = []
+        for future, task_id, elapsed in timed_out_futures:
+            try:
+                should_stop = request_task_cancel(task_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("触发超时停止失败(task=%s): %s", task_id, exc)
+                continue
+            if not should_stop:
+                continue
+
+            _mark_task_timeout_requested(task_id)
+            try:
+                update_task_status(task_id, TaskStatus.TIMEOUT.value)
+            except Exception:  # noqa: BLE001
+                pass
+            timeout_msg = (
+                f"任务执行超过 {int(self._task_timeout_seconds)} 秒，"
+                f"已触发超时停止（已运行 {int(elapsed)} 秒）"
+            )
+            _record_task_error(task_id, stage="watchdog", error_text=timeout_msg)
+            LOGGER.warning("任务超时已触发停止(task=%s, elapsed=%ss)", task_id, int(elapsed))
+            if self._detach_timed_out_future(future, task_id):
+                detached_task_ids.append(task_id)
+
+        if detached_task_ids:
+            self._rotate_pool_for_timeouts(detached_task_ids)
+
+    def _detach_timed_out_future(self, future: Future[Any], task_id: int) -> bool:
+        """将超时任务从调度计数中摘除，避免阻塞后续排队任务。"""
+        with self._futures_lock:
+            if future not in self._futures:
+                return False
+            self._futures.pop(future, None)
+            self._detached_futures[future] = int(task_id)
+            return True
+
+    def _rotate_pool_for_timeouts(self, task_ids: list[int]) -> None:
+        """重建线程池，避免被已超时的阻塞线程长期占满。"""
+        old_pool = self._pool
+        self._pool_generation += 1
+        self._pool = self._build_thread_pool()
+        LOGGER.warning(
+            "检测到超时任务 %s，执行器已切换到线程池代际 g%s。",
+            task_ids,
+            self._pool_generation,
+        )
+        old_pool.shutdown(wait=False, cancel_futures=True)
 
 
 @st.cache_resource(show_spinner=False)
@@ -232,6 +436,8 @@ def _get_task_executor() -> _PersistentTaskExecutor:
     executor = _PersistentTaskExecutor(
         max_workers=TASK_EXECUTOR_MAX_WORKERS,
         poll_interval_seconds=TASK_EXECUTOR_POLL_INTERVAL_SECONDS,
+        task_timeout_seconds=TASK_EXECUTOR_TASK_TIMEOUT_SECONDS,
+        timeout_overflow_workers=TASK_EXECUTOR_TIMEOUT_OVERFLOW_WORKERS,
     )
     executor.start()
     return executor
@@ -271,8 +477,12 @@ def main() -> None:
         return
     if "db_initialized" not in st.session_state:
         st.session_state.db_initialized = False
-    if not st.session_state.db_initialized and DB_AUTO_INIT_ON_STARTUP:
-        _initialize_database(show_feedback=False)
+    if DB_SCHEMA_READY_SESSION_KEY not in st.session_state:
+        st.session_state[DB_SCHEMA_READY_SESSION_KEY] = False
+    if DB_SCHEMA_ERROR_SESSION_KEY not in st.session_state:
+        st.session_state[DB_SCHEMA_ERROR_SESSION_KEY] = ""
+    if not bool(st.session_state.get(DB_SCHEMA_READY_SESSION_KEY)):
+        _ensure_database_schema_ready(show_feedback=False)
     ensure_dir(DOWNLOAD_DIR)
     _get_task_executor().start()
 
@@ -287,6 +497,7 @@ def main() -> None:
         _render_top_actions()
 
     is_processing = st.session_state.running_task_id is not None
+    schema_ready = bool(st.session_state.get(DB_SCHEMA_READY_SESSION_KEY))
     _inject_start_button_loading_style(is_processing)
 
     col_input, col_action = st.columns([4, 1], vertical_alignment="bottom")
@@ -301,10 +512,22 @@ def main() -> None:
             type="primary",
             use_container_width=True,
             key="start_process_btn",
-            disabled=not user_input or is_processing,
+            disabled=not user_input or is_processing or not schema_ready,
         )
 
+    if not schema_ready:
+        schema_error = str(st.session_state.get(DB_SCHEMA_ERROR_SESSION_KEY, "")).strip()
+        detail_text = f"详情：{schema_error}" if schema_error else "请稍后重试。"
+        st.error(f"数据库 Schema 校验失败，已禁用任务提交。{detail_text}")
+        if st.button("重试 Schema 校验", type="secondary", key="retry_schema_check_main"):
+            _ensure_database_schema_ready(show_feedback=True)
+            st.rerun()
+
     if run_btn and user_input:
+        if not bool(st.session_state.get(DB_SCHEMA_READY_SESSION_KEY)):
+            st.error("数据库 Schema 未就绪，请先完成校验。")
+            st.toast("❌ 数据库 Schema 未就绪")
+            return
         if not st.session_state.db_initialized and not _probe_database_ready():
             st.error("数据库尚未初始化。请在右上角“⚙️ -> 数据库维护”中手动初始化。")
             st.toast("❌ 数据库尚未初始化")
@@ -335,7 +558,7 @@ def _start_task(url: str, system_prompt: Optional[str]) -> int:
         _get_task_executor().notify_new_task()
     except Exception as exc:  # noqa: BLE001
         _take_task_prompt(task_id)
-        _mark_task_failed_safely(task_id, f"提交任务到执行队列失败：{exc}")
+        _mark_task_failed_safely(task_id, f"提交任务到执行队列失败：{exc}", stage="queue")
         st.error(f"任务提交失败：{exc}")
     return task_id
 
@@ -346,7 +569,11 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
 
     注意：这里不依赖 Streamlit UI 状态，避免浏览器断开导致任务中断。
     """
+    current_stage = "downloading"
     try:
+        _clear_task_timeout_requested(task_id)
+        _raise_if_task_cancel_requested(task_id)
+
         existing_task = get_task(task_id, include_content=False)
         audio_path: Optional[Path] = None
         if existing_task and existing_task.audio_file_path:
@@ -355,8 +582,11 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
                 audio_path = candidate_path
 
         if audio_path is None:
+            current_stage = "downloading"
             update_task_status(task_id, TaskStatus.DOWNLOADING.value)
+            _raise_if_task_cancel_requested(task_id)
             audio_path, info = download_audio(url, download_dir=DOWNLOAD_DIR, return_info=True)
+            _raise_if_task_cancel_requested(task_id)
             update_task_content(
                 task_id,
                 audio_file_path=str(audio_path),
@@ -373,22 +603,30 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
             existing_raw_transcript = get_task_raw_transcript(task_id) or ""
             summary_source = existing_transcript or existing_raw_transcript
             if summary_source:
+                current_stage = "summarizing"
                 update_task_status(task_id, TaskStatus.SUMMARIZING.value)
+                _raise_if_task_cancel_requested(task_id)
                 summary = summarizer_module.generate_summary(
                     summary_source,
                     system_prompt=system_prompt,
                 )
+                _raise_if_task_cancel_requested(task_id)
                 update_task_content(task_id, summary_text=summary)
                 update_task_status(task_id, TaskStatus.COMPLETED.value)
+                _clear_task_error(task_id)
+                clear_task_cancel_request(task_id)
                 return
 
+        current_stage = "transcribing"
         update_task_status(task_id, TaskStatus.TRANSCRIBING.value)
+        _raise_if_task_cancel_requested(task_id)
 
         resume_chunks = None
         if existing_progress and existing_progress.get("completed_chunks", 0) > 0:
             resume_chunks = existing_progress["chunks"]
 
         def on_chunk_completed(current: int, total: int, chunk_text: str, start_sec: float, end_sec: float) -> None:
+            _raise_if_task_cancel_requested(task_id)
             update_transcription_progress(
                 task_id=task_id,
                 chunk_index=current - 1,
@@ -408,6 +646,7 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
             progress_callback=on_chunk_completed,
             resume_from_chunks=resume_chunks,
         )
+        _raise_if_task_cancel_requested(task_id)
         transcript = _build_readable_transcript(raw_transcript)
         update_task_content(
             task_id,
@@ -415,14 +654,29 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
             transcript_raw_text=raw_transcript,
         )
 
+        current_stage = "summarizing"
         update_task_status(task_id, TaskStatus.SUMMARIZING.value)
+        _raise_if_task_cancel_requested(task_id)
         summary = summarizer_module.generate_summary(
             transcript or raw_transcript,
             system_prompt=system_prompt,
         )
+        _raise_if_task_cancel_requested(task_id)
         update_task_content(task_id, summary_text=summary)
 
         update_task_status(task_id, TaskStatus.COMPLETED.value)
+        _clear_task_error(task_id)
+        clear_task_cancel_request(task_id)
+    except TaskCancelledError as exc:
+        if exc.reason == "timeout":
+            _mark_task_timeout_safely(task_id, str(exc), stage="watchdog")
+        else:
+            try:
+                update_task_status(task_id, TaskStatus.CANCELLED.value)
+            except Exception:  # noqa: BLE001
+                pass
+            _record_task_cancelled(task_id)
+        clear_task_cancel_request(task_id)
     except Exception as exc:  # noqa: BLE001
         try:
             partial_raw_transcript = assemble_partial_transcript(task_id)
@@ -435,7 +689,7 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
                 )
         except Exception:  # noqa: BLE001
             pass
-        _mark_task_failed_safely(task_id, str(exc))
+        _mark_task_failed_safely(task_id, str(exc), stage=current_stage)
 
 
 def _render_running_task(task_id: int) -> Optional[str]:
@@ -552,7 +806,12 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
             if regen_running:
                 st.info("⏳ 正在生成总结，请勿重复点击。")
 
-            if task.status in {TaskStatus.SUMMARIZING.value, TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}:
+            if task.status in {
+                TaskStatus.SUMMARIZING.value,
+                TaskStatus.COMPLETED.value,
+                TaskStatus.FAILED.value,
+                TaskStatus.TIMEOUT.value,
+            }:
                 regen_btn_label = "生成中..." if regen_running else ("重新生成总结" if summary_text else "生成总结")
                 if st.button(
                     regen_btn_label,
@@ -620,11 +879,38 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
         f"时长：{_format_duration(task.video_duration_seconds)}, "
         f"创建时间：{task.created_at}"
     )
-    if task.status == TaskStatus.FAILED.value:
-        st.warning("最近一次处理失败。若下方仍显示旧总结，说明本次重新生成未成功覆盖。")
+    cancellable_statuses = {
+        TaskStatus.WAITING.value,
+        TaskStatus.DOWNLOADING.value,
+        TaskStatus.TRANSCRIBING.value,
+        TaskStatus.SUMMARIZING.value,
+    }
+    if task.status in cancellable_statuses:
+        if st.button("停止任务", key=f"cancel_task_{task.id}", type="secondary"):
+            if request_task_cancel(task.id):
+                st.toast("已发送停止请求，当前阶段完成后将停止")
+                st.rerun()
+            else:
+                st.info("任务状态已变化，无需停止。")
+    failed_like_statuses = {TaskStatus.FAILED.value, TaskStatus.TIMEOUT.value}
+    if task.status in failed_like_statuses:
+        if task.status == TaskStatus.TIMEOUT.value:
+            st.warning("任务因超时被中止。可直接重试；若频繁超时，建议提高超时阈值。")
+        else:
+            st.warning("最近一次处理失败。若下方仍显示旧总结，说明本次重新生成未成功覆盖。")
+        error_info = get_task_error_info(task.id)
+        if error_info:
+            st.caption("结构化错误信息")
+            st.json(error_info, expanded=False)
+    elif task.status == TaskStatus.CANCELLED.value:
+        st.info("任务已取消。可重新提交同一链接发起新任务。")
+        error_info = get_task_error_info(task.id)
+        if error_info:
+            st.caption("结构化错误信息")
+            st.json(error_info, expanded=False)
 
     # 显示转写进度信息
-    if task.status == TaskStatus.FAILED.value:
+    if task.status in failed_like_statuses:
         progress = get_transcription_progress(task.id)
         has_progress = bool(progress and progress.get("completed_chunks", 0) > 0)
         if has_progress:
@@ -634,21 +920,20 @@ def _render_history(default_task_id: Optional[int] = None) -> None:
         retry_col, restart_col = st.columns(2)
         with retry_col:
             if st.button(
-                "从断点继续转写",
+                "重试任务（自动）",
                 use_container_width=True,
                 type="primary",
-                key=f"retry_{task.id}",
-                disabled=not has_progress,
+                key=f"retry_task_{task.id}",
             ):
-                _retry_transcription(task)
+                _retry_task_in_queue(task, restart_from_scratch=False)
         with restart_col:
             if st.button(
-                "从头开始转写",
+                "从头重跑任务",
                 use_container_width=True,
                 type="secondary",
-                key=f"restart_{task.id}",
+                key=f"restart_task_{task.id}",
             ):
-                _restart_transcription(task)
+                _retry_task_in_queue(task, restart_from_scratch=True)
 
 
 def _render_top_actions() -> None:
@@ -705,6 +990,10 @@ def _notify_task_result(task: Task) -> None:
 
     if task.status == TaskStatus.COMPLETED.value:
         st.toast("✅ 总结完成")
+    elif task.status == TaskStatus.TIMEOUT.value:
+        st.toast("⏱️ 任务超时，请重试")
+    elif task.status == TaskStatus.CANCELLED.value:
+        st.toast("⏹️ 任务已取消")
     elif task.status == TaskStatus.FAILED.value:
         st.toast("❌ 任务失败，请查看详情")
     else:
@@ -1031,16 +1320,27 @@ def _render_regen_dialog(task: Task) -> None:
 
 def _initialize_database(show_feedback: bool) -> bool:
     """执行数据库初始化，并更新会话内状态。"""
+    return _ensure_database_schema_ready(show_feedback=show_feedback)
+
+
+def _ensure_database_schema_ready(show_feedback: bool) -> bool:
+    """校验并补齐数据库 Schema。失败时更新会话状态并返回 False。"""
     try:
         init_db()
         st.session_state.db_initialized = True
+        st.session_state[DB_SCHEMA_READY_SESSION_KEY] = True
+        st.session_state[DB_SCHEMA_ERROR_SESSION_KEY] = ""
         if show_feedback:
-            st.success("数据库初始化完成")
+            st.success("数据库 Schema 校验完成")
         return True
     except Exception as exc:  # noqa: BLE001
+        error_text = str(exc)
         st.session_state.db_initialized = False
+        st.session_state[DB_SCHEMA_READY_SESSION_KEY] = False
+        st.session_state[DB_SCHEMA_ERROR_SESSION_KEY] = error_text
+        LOGGER.error("数据库 Schema 校验失败：%s", error_text)
         if show_feedback:
-            st.error(f"数据库初始化失败：{exc}")
+            st.error(f"数据库 Schema 校验失败：{error_text}")
         return False
 
 
@@ -1062,12 +1362,13 @@ def _render_db_not_ready_hint(exc: Exception, button_key: str) -> None:
             st.rerun()
 
 
-def _mark_task_failed_safely(task_id: int, error_text: str) -> None:
+def _mark_task_failed_safely(task_id: int, error_text: str, stage: str = "system") -> None:
     """尽力将任务标记为失败，避免卡在 waiting/transcribing。"""
     try:
         update_task_status(task_id, TaskStatus.FAILED.value)
     except Exception:  # noqa: BLE001
         return
+    _record_task_error(task_id, stage=stage, error_text=error_text)
 
     # 可选补充一条可见错误信息，避免空白失败记录。
     try:
@@ -1077,6 +1378,15 @@ def _mark_task_failed_safely(task_id: int, error_text: str) -> None:
             update_task_content(task_id, summary_text=f"[系统] 任务异常终止：{error_text}")
     except Exception:  # noqa: BLE001
         pass
+
+
+def _mark_task_timeout_safely(task_id: int, error_text: str, stage: str = "watchdog") -> None:
+    """尽力将任务标记为超时，并保留结构化错误信息。"""
+    try:
+        update_task_status(task_id, TaskStatus.TIMEOUT.value)
+    except Exception:  # noqa: BLE001
+        return
+    _record_task_error(task_id, stage=stage, error_text=error_text)
 
 
 def _cleanup_files() -> int:
@@ -1183,13 +1493,11 @@ def _regenerate_summary(task: Task, model: Optional[str] = None) -> None:
             update_task_content(task.id, summary_text=summary)
             _set_cached_task_text(task.id, "summary", summary)
             update_task_status(task.id, TaskStatus.COMPLETED.value)
+            _clear_task_error(task.id)
             status_box.update(label="总结重新生成完成", state="complete")
             _set_regen_feedback(task.id, "success", "总结已重新生成")
     except Exception as exc:  # noqa: BLE001
-        try:
-            update_task_status(task.id, TaskStatus.FAILED.value)
-        except Exception:  # noqa: BLE001
-            pass
+        _mark_task_failed_safely(task.id, str(exc), stage="summarizing")
         if not (task.summary_text and task.summary_text.strip()):
             try:
                 update_task_content(task.id, summary_text=f"[系统] 重新生成失败：{exc}")
@@ -1213,20 +1521,47 @@ def _restart_transcription(task: Task) -> None:
     _run_transcription_flow(task, restart_from_scratch=True)
 
 
+def _retry_task_in_queue(task: Task, restart_from_scratch: bool = False) -> None:
+    """将失败/超时任务重新入队，支持保留断点或从头重跑。"""
+    try:
+        clear_task_cancel_request(task.id)
+        _clear_task_timeout_requested(task.id)
+        if restart_from_scratch:
+            reset_transcription_data(task.id)
+            _set_cached_task_text(task.id, "transcript", "")
+            _set_cached_task_text(task.id, "raw_transcript", "")
+            _set_cached_task_text(task.id, "summary", "")
+        update_task_status(task.id, TaskStatus.WAITING.value)
+        _clear_task_error(task.id)
+        _remember_task_prompt(task.id, _get_active_prompt())
+        _get_task_executor().notify_new_task()
+        st.session_state.running_task_id = task.id
+        st.toast("已加入重试队列")
+        st.rerun()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"提交重试失败：{exc}")
+
+
 def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
     """执行转写+总结流程，支持断点续传和从头重跑两种模式。"""
+    clear_task_cancel_request(task.id)
     if not task.audio_file_path:
-        st.error("音频文件路径缺失，无法继续转写")
+        missing_path_error = "音频文件路径缺失，无法继续转写"
+        _record_task_error(task.id, stage="transcribing", error_text=missing_path_error)
+        st.error(missing_path_error)
         return
 
     audio_path = Path(task.audio_file_path)
     if not audio_path.exists():
-        st.error(f"音频文件不存在：{audio_path}")
+        missing_file_error = f"音频文件不存在：{audio_path}"
+        _record_task_error(task.id, stage="transcribing", error_text=missing_file_error)
+        st.error(missing_file_error)
         return
 
     status_label = "从头重新转写中..." if restart_from_scratch else "继续转写中..."
     success_message = "已从头完成转写" if restart_from_scratch else "转写已完成"
     with st.status(status_label, expanded=True) as status_box:
+        current_stage = "transcribing"
         try:
             update_task_status(task.id, TaskStatus.TRANSCRIBING.value)
 
@@ -1289,6 +1624,7 @@ def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
             _set_cached_task_text(task.id, "raw_transcript", raw_transcript)
 
             # 继续总结
+            current_stage = "summarizing"
             update_task_status(task.id, TaskStatus.SUMMARIZING.value)
             status_box.write("总结中（LLM）...")
             summary = summarizer_module.generate_summary(
@@ -1299,6 +1635,7 @@ def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
             _set_cached_task_text(task.id, "summary", summary)
 
             update_task_status(task.id, TaskStatus.COMPLETED.value)
+            _clear_task_error(task.id)
             status_box.update(label="处理完成", state="complete")
             st.success(success_message)
         except Exception as exc:  # noqa: BLE001
@@ -1315,7 +1652,7 @@ def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
                 _set_cached_task_text(task.id, "raw_transcript", partial_raw_transcript)
                 status_box.warning(f"转写部分完成（{len(partial_transcript)} 字符），但遇到错误")
 
-            update_task_status(task.id, TaskStatus.FAILED.value)
+            _mark_task_failed_safely(task.id, str(exc), stage=current_stage)
             status_box.update(label="处理失败", state="error")
             status_box.write(f"错误：{exc}")
 

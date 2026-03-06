@@ -62,6 +62,8 @@ class TaskStatus(str, Enum):
     DOWNLOADING = "downloading"
     TRANSCRIBING = "transcribing"
     SUMMARIZING = "summarizing"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -248,6 +250,18 @@ def _build_like_pattern(keyword: str) -> str:
     return f"%{escaped_keyword}%"
 
 
+def _is_missing_column_error(exc: Exception, column_name: str) -> bool:
+    """判断异常是否由缺失列导致（兼容不同数据库报错文案）。"""
+    lowered = str(exc).lower()
+    col = column_name.strip().lower()
+    if not col:
+        return False
+    return (
+        f"no such column: {col}" in lowered
+        or f"has no column named {col}" in lowered
+    )
+
+
 def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
     """
     初始化 SQLite 数据库，创建 tasks 表和必要索引。
@@ -277,6 +291,11 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
                     transcript_text TEXT,
                     transcript_raw_text TEXT,
                     summary_text TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    error_stage TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    error_updated_at DATETIME,
                     status TEXT NOT NULL DEFAULT 'waiting',
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
@@ -318,24 +337,48 @@ def create_task(
     """
     normalized_status = _validate_status(status)
     with get_connection(db_path) as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO tasks (
-                bilibili_url, video_title, video_duration_seconds, audio_file_path,
-                transcript_text, summary_text, status
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO tasks (
+                    bilibili_url, video_title, video_duration_seconds, audio_file_path,
+                    transcript_text, summary_text, status, cancel_requested
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    bilibili_url,
+                    video_title,
+                    video_duration_seconds,
+                    audio_file_path,
+                    None,
+                    None,
+                    normalized_status,
+                    0,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                bilibili_url,
-                video_title,
-                video_duration_seconds,
-                audio_file_path,
-                None,
-                None,
-                normalized_status,
-            ),
-        )
+        except Exception as exc:  # noqa: BLE001
+            # 兼容旧 schema（尚未添加 cancel_requested 列）
+            if "cancel_requested" not in str(exc):
+                raise
+            cursor = connection.execute(
+                """
+                INSERT INTO tasks (
+                    bilibili_url, video_title, video_duration_seconds, audio_file_path,
+                    transcript_text, summary_text, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    bilibili_url,
+                    video_title,
+                    video_duration_seconds,
+                    audio_file_path,
+                    None,
+                    None,
+                    normalized_status,
+                ),
+            )
         _commit_connection(connection, sync_remote=True)
         return int(cursor.lastrowid)
 
@@ -350,16 +393,31 @@ def claim_next_waiting_task(
         成功认领时返回 TaskQueueItem；队列为空或竞争失败时返回 None。
     """
     with get_connection(db_path) as connection:
-        cursor = connection.execute(
-            """
-            SELECT id, bilibili_url
-            FROM tasks
-            WHERE status = ?
-            ORDER BY datetime(created_at) ASC, id ASC
-            LIMIT 1
-            """,
-            (TaskStatus.WAITING.value,),
-        )
+        try:
+            cursor = connection.execute(
+                """
+                SELECT id, bilibili_url
+                FROM tasks
+                WHERE status = ? AND cancel_requested = 0
+                ORDER BY datetime(created_at) ASC, id ASC
+                LIMIT 1
+                """,
+                (TaskStatus.WAITING.value,),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 兼容旧 schema（尚未添加 cancel_requested 列）
+            if "cancel_requested" not in str(exc):
+                raise
+            cursor = connection.execute(
+                """
+                SELECT id, bilibili_url
+                FROM tasks
+                WHERE status = ?
+                ORDER BY datetime(created_at) ASC, id ASC
+                LIMIT 1
+                """,
+                (TaskStatus.WAITING.value,),
+            )
         row = cursor.fetchone()
         if not row:
             return None
@@ -371,14 +429,27 @@ def claim_next_waiting_task(
             task_id = int(row["id"])
             task_url = str(row["bilibili_url"])
 
-        update_cursor = connection.execute(
-            """
-            UPDATE tasks
-            SET status = ?
-            WHERE id = ? AND status = ?
-            """,
-            (TaskStatus.DOWNLOADING.value, task_id, TaskStatus.WAITING.value),
-        )
+        try:
+            update_cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?, cancel_requested = 0
+                WHERE id = ? AND status = ? AND cancel_requested = 0
+                """,
+                (TaskStatus.DOWNLOADING.value, task_id, TaskStatus.WAITING.value),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 兼容旧 schema（尚未添加 cancel_requested 列）
+            if "cancel_requested" not in str(exc):
+                raise
+            update_cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?
+                WHERE id = ? AND status = ?
+                """,
+                (TaskStatus.DOWNLOADING.value, task_id, TaskStatus.WAITING.value),
+            )
         claimed_rows = int(getattr(update_cursor, "rowcount", 0) or 0)
         if claimed_rows <= 0:
             _commit_connection(connection, sync_remote=False)
@@ -392,25 +463,48 @@ def recover_interrupted_tasks(
     db_path: Path | str = DEFAULT_DB_PATH,
 ) -> int:
     """
-    启动时回收异常中断的任务：将中间态统一回退到 waiting。
+    启动时回收异常中断的任务：将中间态回退到 waiting/cancelled。
 
     Returns:
         被回收的任务条数。
     """
     with get_connection(db_path) as connection:
-        cursor = connection.execute(
-            """
-            UPDATE tasks
-            SET status = ?
-            WHERE status IN (?, ?, ?)
-            """,
-            (
-                TaskStatus.WAITING.value,
-                TaskStatus.DOWNLOADING.value,
-                TaskStatus.TRANSCRIBING.value,
-                TaskStatus.SUMMARIZING.value,
-            ),
-        )
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = CASE
+                        WHEN cancel_requested = 1 THEN ?
+                        ELSE ?
+                    END,
+                    cancel_requested = 0
+                WHERE status IN (?, ?, ?)
+                """,
+                (
+                    TaskStatus.CANCELLED.value,
+                    TaskStatus.WAITING.value,
+                    TaskStatus.DOWNLOADING.value,
+                    TaskStatus.TRANSCRIBING.value,
+                    TaskStatus.SUMMARIZING.value,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 兼容旧 schema（尚未添加 cancel_requested 列）
+            if "cancel_requested" not in str(exc):
+                raise
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?
+                WHERE status IN (?, ?, ?)
+                """,
+                (
+                    TaskStatus.WAITING.value,
+                    TaskStatus.DOWNLOADING.value,
+                    TaskStatus.TRANSCRIBING.value,
+                    TaskStatus.SUMMARIZING.value,
+                ),
+            )
         _commit_connection(connection, sync_remote=True)
         return int(getattr(cursor, "rowcount", 0) or 0)
 
@@ -428,6 +522,141 @@ def update_task_status(
     """
     normalized_status = _validate_status(status)
     _update_fields(task_id, {"status": normalized_status}, db_path)
+
+
+def request_task_cancel(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> bool:
+    """
+    请求取消任务。
+
+    waiting 任务会直接进入 cancelled，进行中的任务会置 cancel_requested=1 等待协作中止。
+    """
+    with get_connection(db_path) as connection:
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET cancel_requested = CASE
+                        WHEN status = ? THEN 0
+                        ELSE 1
+                    END,
+                    status = CASE
+                        WHEN status = ? THEN ?
+                        ELSE status
+                    END
+                WHERE id = ?
+                  AND status IN (?, ?, ?, ?)
+                """,
+                (
+                    TaskStatus.WAITING.value,
+                    TaskStatus.WAITING.value,
+                    TaskStatus.CANCELLED.value,
+                    task_id,
+                    TaskStatus.WAITING.value,
+                    TaskStatus.DOWNLOADING.value,
+                    TaskStatus.TRANSCRIBING.value,
+                    TaskStatus.SUMMARIZING.value,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 兼容旧 schema：仅支持 waiting -> cancelled
+            if "cancel_requested" not in str(exc):
+                raise
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?
+                WHERE id = ? AND status = ?
+                """,
+                (TaskStatus.CANCELLED.value, task_id, TaskStatus.WAITING.value),
+            )
+        _commit_connection(connection, sync_remote=True)
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0
+
+
+def clear_task_cancel_request(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> None:
+    """清除取消请求标记。"""
+    try:
+        _update_fields(task_id, {"cancel_requested": 0}, db_path)
+    except Exception as exc:  # noqa: BLE001
+        if "cancel_requested" in str(exc):
+            return
+        raise
+
+
+def is_task_cancel_requested(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> bool:
+    """检查任务是否收到取消请求。"""
+    with get_connection(db_path) as connection:
+        try:
+            cursor = connection.execute(
+                "SELECT cancel_requested FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            value = row[0] if _is_sequence_row(row) else row["cancel_requested"]
+            return bool(int(value or 0))
+        except Exception as exc:  # noqa: BLE001
+            if "cancel_requested" in str(exc):
+                return False
+            raise
+
+
+def update_task_error(
+    task_id: int,
+    *,
+    error_stage: Optional[str],
+    error_code: Optional[str],
+    error_message: Optional[str],
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> None:
+    """写入任务结构化错误信息。"""
+    try:
+        _update_fields(
+            task_id,
+            {
+                "error_stage": (error_stage or "").strip() or None,
+                "error_code": (error_code or "").strip() or None,
+                "error_message": (error_message or "").strip() or None,
+                "error_updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            },
+            db_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 兼容旧 schema（尚未添加 error_* 列）
+        if (
+            _is_missing_column_error(exc, "error_stage")
+            or _is_missing_column_error(exc, "error_code")
+            or _is_missing_column_error(exc, "error_message")
+            or _is_missing_column_error(exc, "error_updated_at")
+        ):
+            return
+        raise
+
+
+def clear_task_error(task_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> None:
+    """清空任务结构化错误信息。"""
+    try:
+        _update_fields(
+            task_id,
+            {
+                "error_stage": None,
+                "error_code": None,
+                "error_message": None,
+                "error_updated_at": None,
+            },
+            db_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 兼容旧 schema（尚未添加 error_* 列）
+        if (
+            _is_missing_column_error(exc, "error_stage")
+            or _is_missing_column_error(exc, "error_code")
+            or _is_missing_column_error(exc, "error_message")
+            or _is_missing_column_error(exc, "error_updated_at")
+        ):
+            return
+        raise
 
 
 def update_task_content(
@@ -558,6 +787,51 @@ def get_task_raw_transcript(task_id: int, db_path: Path | str = DEFAULT_DB_PATH)
         if not row:
             return None
         return row[0] if _is_sequence_row(row) else row["transcript_raw_text"]
+
+
+def get_task_error_info(
+    task_id: int, db_path: Path | str = DEFAULT_DB_PATH
+) -> Optional[Dict[str, Optional[str]]]:
+    """读取任务结构化错误信息。"""
+    with get_connection(db_path) as connection:
+        try:
+            cursor = connection.execute(
+                """
+                SELECT error_stage, error_code, error_message, error_updated_at
+                FROM tasks
+                WHERE id = ?
+                """,
+                (task_id,),
+            )
+        except Exception as exc:  # noqa: BLE001
+            if (
+                _is_missing_column_error(exc, "error_stage")
+                or _is_missing_column_error(exc, "error_code")
+                or _is_missing_column_error(exc, "error_message")
+                or _is_missing_column_error(exc, "error_updated_at")
+            ):
+                return None
+            raise
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        if _is_sequence_row(row):
+            stage, code, message, updated_at = row[0], row[1], row[2], row[3]
+        else:
+            stage = row["error_stage"]
+            code = row["error_code"]
+            message = row["error_message"]
+            updated_at = row["error_updated_at"]
+
+        if not (stage or code or message):
+            return None
+        return {
+            "stage": str(stage) if stage is not None else None,
+            "code": str(code) if code is not None else None,
+            "message": str(message) if message is not None else None,
+            "updated_at": str(updated_at) if updated_at is not None else None,
+        }
 
 
 def list_tasks(
@@ -894,6 +1168,11 @@ def _update_fields(
         "transcript_text",
         "transcript_raw_text",
         "summary_text",
+        "cancel_requested",
+        "error_stage",
+        "error_code",
+        "error_message",
+        "error_updated_at",
         "video_duration_seconds",
         "status",
     }
@@ -946,6 +1225,11 @@ def _is_local_replica_schema_ready() -> bool:
         "transcript_text",
         "transcript_raw_text",
         "summary_text",
+        "cancel_requested",
+        "error_stage",
+        "error_code",
+        "error_message",
+        "error_updated_at",
         "status",
         "created_at",
         "transcription_progress",
@@ -1156,10 +1440,16 @@ def _ensure_extra_columns(connection: Any) -> None:
     cursor = connection.execute("PRAGMA table_info(tasks);")
     existing = {_table_info_name(row) for row in cursor.fetchall()}
     if "video_duration_seconds" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 video_duration_seconds")
         connection.execute("ALTER TABLE tasks ADD COLUMN video_duration_seconds INTEGER;")
     if "transcript_raw_text" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 transcript_raw_text")
         connection.execute("ALTER TABLE tasks ADD COLUMN transcript_raw_text TEXT;")
+    if "cancel_requested" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 cancel_requested")
+        connection.execute("ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;")
     _ensure_transcription_columns(connection)
+    _ensure_error_columns(connection)
 
 
 def _ensure_transcription_columns(connection: Any) -> None:
@@ -1168,11 +1458,35 @@ def _ensure_transcription_columns(connection: Any) -> None:
     existing = {_table_info_name(row) for row in cursor.fetchall()}
 
     if "transcription_progress" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 transcription_progress")
         connection.execute("ALTER TABLE tasks ADD COLUMN transcription_progress TEXT;")
     if "transcription_total_chunks" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 transcription_total_chunks")
         connection.execute("ALTER TABLE tasks ADD COLUMN transcription_total_chunks INTEGER;")
     if "transcription_completed_chunks" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 transcription_completed_chunks")
         connection.execute("ALTER TABLE tasks ADD COLUMN transcription_completed_chunks INTEGER;")
+
+    _commit_connection(connection, sync_remote=False)
+
+
+def _ensure_error_columns(connection: Any) -> None:
+    """为结构化错误信息添加必要字段（幂等操作）。"""
+    cursor = connection.execute("PRAGMA table_info(tasks);")
+    existing = {_table_info_name(row) for row in cursor.fetchall()}
+
+    if "error_stage" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 error_stage")
+        connection.execute("ALTER TABLE tasks ADD COLUMN error_stage TEXT;")
+    if "error_code" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 error_code")
+        connection.execute("ALTER TABLE tasks ADD COLUMN error_code TEXT;")
+    if "error_message" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 error_message")
+        connection.execute("ALTER TABLE tasks ADD COLUMN error_message TEXT;")
+    if "error_updated_at" not in existing:
+        LOGGER.info("数据库迁移：tasks 新增列 error_updated_at")
+        connection.execute("ALTER TABLE tasks ADD COLUMN error_updated_at DATETIME;")
 
     _commit_connection(connection, sync_remote=False)
 
