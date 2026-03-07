@@ -1,120 +1,53 @@
-## Bilibili 视频转录与智能总结工具
+# BilView · 让 B 站长视频 3 分钟变成可读笔记
 
-本项目提供本地化的一键流程：输入 B 站链接 → 下载音频 → ASR 转写（默认 Groq）→ LLM 总结 → 本地持久化与导出。
+> 面向小白用户：贴链接就能自动完成下载、转写、总结和导出。
 
-### 主要特性
-- **默认在线转写**：内置 Groq ASR（支持多 API Key 轮询），并保留本地 Whisper 兜底能力。
-- **一键流程**：Streamlit 界面触发，自动串联下载 / 转写 / 总结并写入数据库（默认 SQLite，可切换 Turso）。
-- **结果持久化**：默认写入 `/data/data/app.db`（如存在 HF /data 持久卷），否则使用仓库内 `data/app.db`，并可用环境变量 `BILVIEW_STORAGE_DIR` 自定义。
-- **可配置 LLM**：默认 `gemini-2.5-pro-1m`（x666 接口），支持自定义模型、温度、API Key。
-- **安全实践**：状态存储英文枚举，UI 层中文映射；SQL 全部使用占位符。
-- **元信息存储**：任务表包含视频标题与时长（秒），便于后续统计与展示。
+BilView 是一个本地化的 AI 视频知识提炼工具，帮助你把「看完就忘」的长视频，变成「可保存、可检索、可复用」的文字资产。
 
-### 目录结构
-```
-app.py                # Streamlit 前端与流程编排
-config.py             # 配置与 .env 加载
-core/
-  downloader.py       # yt-dlp 仅提取音频
-  speech_recognition.py  # 语音识别封装（Groq + 本地 Whisper，支持多 key 轮询）
-  transcriber.py      # 转写编排（分片 + 断点续传 + 进度回调）
-  summarizer.py       # LLM 调用与速率限制
-db/
-  database.py         # SQLite 封装（init/CRUD）
-utils/
-  file_helper.py      # 目录与文件工具
-  network.py          # 局域网地址获取
-data/                 # 存储根下的数据目录（/data/data 或本地 ./data，已忽略）
-downloads/            # 存储根下的音频缓存目录（已忽略）
+## 为什么用 BilView
+
+- 上手门槛低：只需要会复制链接和点按钮。
+- 全流程自动化：下载音频 → 语音转写 → AI 总结 → 本地保存。
+- 结果可沉淀：历史任务可回看，支持逐字稿和总结导出。
+- 部署灵活：本地跑、服务器跑、手机访问都支持。
+
+## 小白 3 步跑起来（推荐）
+
+1) 安装依赖
+```bash
+pip install -r requirements.txt
 ```
 
-### 架构与流程图
-- 查看详细架构说明： [docs/architecture.md](docs/architecture.md)
-- 默认总结 Prompt： [docs/default_prompt.md](docs/default_prompt.md)
+2) 在项目根目录创建 `.env`
+```env
+X666_API_KEY=your_llm_key
+GROQ_API_KEY=your_groq_key
+```
 
+3) 启动应用
+```bash
+streamlit run app.py
+```
 
+打开 `http://localhost:8501`，粘贴 B 站链接即可开始。
 
-### 快速开始
-1) 安装依赖（已包含 yt-dlp / whisper / openai / streamlit 等）  
-   ```bash
-   pip install -r requirements.txt
-   ```
-   需本地可用 `ffmpeg`；若切到本地 Whisper 模式，首次运行会下载模型（需联网）。
+## 文档导航
 
-2) 配置 API Key（可选，默认使用文档示例值）  
-   新建 `.env`（已被 .gitignore）：  
-   ```
-   X666_API_KEY=你的key
-   GROQ_API_KEYS=key1,key2,key3
-   ```
+### 新手优先
 
-   可选：仅配置单个 Groq Key 时也可使用 `GROQ_API_KEY=xxx`。  
-   可选：`ASR_PROVIDER=groq`（默认）或 `ASR_PROVIDER=local_whisper`。
+- [新手快速开始](docs/getting-started.md)
+- [使用指南（从输入到导出）](docs/usage.md)
+- [常见问题排查](docs/troubleshooting.md)
+- [文档总览](docs/README.md)
 
-   若使用 Turso（云端免费数据库），额外配置：
-   ```
-   TURSO_DATABASE_URL=libsql://xxx.turso.io
-   TURSO_AUTH_TOKEN=你的turso-token
-   ```
+### 进阶与技术文档
 
-   若使用 Cloudflare D1（会优先于 Turso）：
-   ```
-   CLOUDFLARE_ACCOUNT_ID=你的account_id
-   CLOUDFLARE_D1_DATABASE_ID=你的database_id
-   CLOUDFLARE_API_TOKEN=你的api_token
-   ```
+- [配置说明](docs/configuration.md)
+- [存储与部署](docs/storage-and-deployment.md)
+- [系统架构](docs/architecture.md)
+- [开发与测试](docs/development.md)
+- [默认总结 Prompt](docs/default_prompt.md)
 
+## License
 
-3) 启动前端  
-   ```bash
-   streamlit run app.py
-   ```
-   浏览器打开 `http://localhost:8501`。
-
-### 使用说明
-- 在输入框粘贴 B 站链接，点击“开始处理”。流程：下载 → 转写（Groq ASR） → 总结（LLM）。  
-- 右侧历史记录可查看/下载逐字稿与总结。  
-- 转写默认使用 Groq Whisper（中文语言），超 25MB 或 5 分钟自动分片。  
-- LLM 调用全局 20s 速率限制，超时/错误将把任务标记为失败。
-
-### 移动端访问
-- 可在本机/服务器运行后用手机浏览器访问，命令示例：  
-  `streamlit run app.py --server.address 0.0.0.0 --server.port 8501`  
-  然后在同一局域网手机浏览器打开 `http://<电脑IP>:8501`。远程则需放行端口或使用内网穿透（frp/ngrok 等）。
-- Streamlit 对窄屏会自动折叠为单列布局；下载按钮在手机上可直接保存文件。
-
-### 配置要点
-- Python 版本建议 3.10/3.12；若平台固定为 3.13，请确保 `audioop-lts` 已安装（requirements 已按条件依赖声明），或通过 `runtime.txt` 指定 3.12。
-- `.env`：`X666_API_KEY`（总结）、`GROQ_API_KEYS`（转写，支持逗号分隔轮询）；若配置 Cloudflare D1 三元组（`CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_D1_DATABASE_ID`、`CLOUDFLARE_API_TOKEN`）将优先使用 D1；否则如配置 `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`，默认数据库会自动切到 Turso。  
-- 可选：`DB_AUTO_INIT_ON_STARTUP=1` 启动时自动执行数据库初始化（默认关闭，推荐在“设置与清理 -> 数据库维护”手动触发）。  
-- `config.py`：`DEFAULT_LLM_API_URL`、`DEFAULT_LLM_MODEL`、`DB_PATH`、`DOWNLOAD_DIR` 等集中管理。  
-- 状态枚举：DB 中存英文 (`waiting/downloading/...`)，UI 层通过 `STATUS_MAP` 映射中文。
-
-### 存储路径与部署
-- 默认存储根：检测到 `/data` 则使用（如 HF Spaces 持久卷），否则回退仓库根目录；可通过环境变量 `BILVIEW_STORAGE_DIR` 覆盖。
-- SQLite 与下载文件分别位于 `data/` 与 `downloads/` 子目录，首次运行自动创建。
-- 部署到云端时建议把持久卷挂载到 `/data` 或设置 `BILVIEW_STORAGE_DIR`，避免重启丢任务与音频。
-
-### 开发与测试
-- 语法检查：`python -m py_compile app.py core/*.py db/*.py`  
-- 单次链路快速验证（示例）：  
-  ```bash
-  python - <<'PY'
-  from core.downloader import download_audio
-  from core.transcriber import audio_to_text
-  from core.summarizer import generate_summary
-  from db.database import init_db
-  init_db()
-  url = "https://b23.tv/dNNt3B6"
-  audio = download_audio(url)
-  text = audio_to_text(audio, language="zh")
-  print(generate_summary(text[:2000])[:200])
-  PY
-  ```
-
-
-### 注意事项
-- `data/` 与 `downloads/` 已忽略，请勿提交运行期数据或音频文件。  
-- 如需本地 Whisper 的 GPU/MPS 加速，安装对应 `torch` 版本；代码会自动选择可用设备并在不支持时回退 CPU。  
-- 若需使用本地 Whisper，可将 `ASR_PROVIDER=local_whisper`，并通过 `model_size` 调整 `small/base/medium`。  
-- 若需更复杂的限流/重试策略，可在 `core/summarizer.py` 扩展。 
+[MIT](LICENSE)
