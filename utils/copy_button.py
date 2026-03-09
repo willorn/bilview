@@ -28,6 +28,7 @@ def create_copy_button_with_tooltip(
     button_hover_color: str = "#ff3333",
     success_message: str = "✓ 已复制到剪贴板",
     error_message: str = "✗ 复制失败",
+    manual_message: str = "⚠️ 自动复制受限，请长按后手动复制",
     success_duration: int = 2000,
     error_duration: int = 3000,
 ) -> str:
@@ -42,6 +43,7 @@ def create_copy_button_with_tooltip(
         button_hover_color: 悬停时背景色
         success_message: 成功提示文字
         error_message: 失败提示文字
+        manual_message: 自动复制受限时的手动复制提示
         success_duration: 成功提示持续时间（毫秒）
         error_duration: 失败提示持续时间（毫秒）
 
@@ -53,6 +55,7 @@ def create_copy_button_with_tooltip(
     escaped_button_text = html_lib.escape(button_text)
     escaped_success_message = json.dumps(success_message)
     escaped_error_message = json.dumps(error_message)
+    escaped_manual_message = json.dumps(manual_message)
     escaped_button_color = json.dumps(button_color)
     escaped_button_hover_color = json.dumps(button_hover_color)
 
@@ -75,8 +78,10 @@ def create_copy_button_with_tooltip(
     </style>
     <div style="display: inline-block; width: fit-content; position: relative; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
         <button
-            onclick="copyToClipboard_{safe_id}()"
+            onclick="copyToClipboard_{safe_id}(event)"
+            ontouchend="copyToClipboard_{safe_id}(event)"
             id="copyBtn_{safe_id}"
+            type="button"
             style="
                 width: auto;
                 padding: {padding_y} 0.5rem;
@@ -116,10 +121,38 @@ def create_copy_button_with_tooltip(
             "></div>
     </div>
     <script>
-    async function copyToClipboard_{safe_id}() {{
+    async function copyToClipboard_{safe_id}(event) {{
+        const dedupeKey = '__copy_btn_lock_{safe_id}';
+        const lastInvoke = Number(window[dedupeKey] || 0);
+        const now = Date.now();
+        if (now - lastInvoke < 650) {{
+            return;
+        }}
+        window[dedupeKey] = now;
+
+        if (event) {{
+            event.preventDefault();
+            event.stopPropagation();
+        }}
+
         const text = {escaped_text};
         const tooltip = document.getElementById('tooltip_{safe_id}');
         const button = document.getElementById('copyBtn_{safe_id}');
+
+        function getCopyHostContext() {{
+            try {{
+                if (window.parent && window.parent.document && window.parent.navigator) {{
+                    return {{
+                        doc: window.parent.document,
+                        win: window.parent,
+                        nav: window.parent.navigator,
+                    }};
+                }}
+            }} catch (e) {{
+                // 访问父窗口受限时降级到当前 iframe 上下文
+            }}
+            return {{ doc: document, win: window, nav: navigator }};
+        }}
 
         function getToastHostDocument() {{
             try {{
@@ -210,24 +243,292 @@ def create_copy_button_with_tooltip(
             }}, duration);
         }}
 
-        try {{
-            if (navigator.clipboard && window.isSecureContext) {{
-                await navigator.clipboard.writeText(text);
-            }} else {{
-                // 不满足 clipboard API 条件时，退回旧方案。
-                const textarea = document.createElement('textarea');
-                textarea.value = text;
-                textarea.setAttribute('readonly', '');
-                textarea.style.position = 'fixed';
-                textarea.style.left = '-9999px';
-                document.body.appendChild(textarea);
-                textarea.select();
+        async function copyByClipboardApi(targetNav, targetWin) {{
+            if (!targetNav || !targetNav.clipboard) {{
+                return false;
+            }}
+            if (targetWin && targetWin.isSecureContext === false) {{
+                return false;
+            }}
+            try {{
+                await targetNav.clipboard.writeText(text);
+                return true;
+            }} catch (e) {{
+                return false;
+            }}
+        }}
 
-                const copied = document.execCommand('copy');
-                document.body.removeChild(textarea);
-                if (!copied) {{
-                    throw new Error('execCommand copy failed');
+        function copyByExecCommandTextarea(targetDoc) {{
+            if (!targetDoc || !targetDoc.body) {{
+                return false;
+            }}
+
+            const textarea = targetDoc.createElement('textarea');
+            textarea.value = text;
+            textarea.setAttribute('readonly', '');
+            textarea.style.position = 'fixed';
+            textarea.style.top = '0';
+            textarea.style.left = '0';
+            textarea.style.width = '1px';
+            textarea.style.height = '1px';
+            textarea.style.opacity = '0';
+            textarea.style.pointerEvents = 'none';
+            targetDoc.body.appendChild(textarea);
+
+            const selection = targetDoc.getSelection ? targetDoc.getSelection() : null;
+            let selectedRange = null;
+            if (selection && selection.rangeCount > 0) {{
+                selectedRange = selection.getRangeAt(0);
+            }}
+
+            textarea.focus({{ preventScroll: true }});
+            textarea.select();
+            textarea.setSelectionRange(0, textarea.value.length);
+
+            let copied = false;
+            try {{
+                copied = targetDoc.execCommand('copy');
+            }} catch (e) {{
+                copied = false;
+            }}
+
+            targetDoc.body.removeChild(textarea);
+            if (selection) {{
+                selection.removeAllRanges();
+                if (selectedRange) {{
+                    selection.addRange(selectedRange);
                 }}
+            }}
+            return copied;
+        }}
+
+        function copyByExecCommandRange(targetDoc) {{
+            if (!targetDoc || !targetDoc.body) {{
+                return false;
+            }}
+
+            const copyNode = targetDoc.createElement('div');
+            copyNode.setAttribute('contenteditable', 'true');
+            copyNode.setAttribute('aria-hidden', 'true');
+            copyNode.textContent = text;
+            copyNode.style.position = 'fixed';
+            copyNode.style.top = '0';
+            copyNode.style.left = '0';
+            copyNode.style.opacity = '0';
+            copyNode.style.pointerEvents = 'none';
+            copyNode.style.whiteSpace = 'pre-wrap';
+            targetDoc.body.appendChild(copyNode);
+
+            const selection = targetDoc.getSelection ? targetDoc.getSelection() : null;
+            const range = targetDoc.createRange ? targetDoc.createRange() : null;
+            if (!selection || !range) {{
+                targetDoc.body.removeChild(copyNode);
+                return false;
+            }}
+
+            selection.removeAllRanges();
+            range.selectNodeContents(copyNode);
+            selection.addRange(range);
+            copyNode.focus({{ preventScroll: true }});
+
+            let copied = false;
+            try {{
+                copied = targetDoc.execCommand('copy');
+            }} catch (e) {{
+                copied = false;
+            }}
+
+            selection.removeAllRanges();
+            targetDoc.body.removeChild(copyNode);
+            return copied;
+        }}
+
+        function showManualCopyDialog(targetDoc) {{
+            if (!targetDoc || !targetDoc.body) {{
+                return;
+            }}
+
+            const styleId = 'global_manual_copy_dialog_style';
+            if (!targetDoc.getElementById(styleId)) {{
+                const styleEl = targetDoc.createElement('style');
+                styleEl.id = styleId;
+                styleEl.textContent = `
+                    .global-manual-copy-overlay {{
+                        position: fixed;
+                        inset: 0;
+                        background: rgba(0, 0, 0, 0.55);
+                        z-index: 2147483001;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        padding: 16px;
+                    }}
+                    .global-manual-copy-panel {{
+                        width: min(520px, 100%);
+                        max-height: 80vh;
+                        background: #ffffff;
+                        border-radius: 12px;
+                        box-shadow: 0 14px 36px rgba(0, 0, 0, 0.24);
+                        padding: 12px;
+                        display: flex;
+                        flex-direction: column;
+                        gap: 8px;
+                    }}
+                    .global-manual-copy-title {{
+                        margin: 0;
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: #111827;
+                    }}
+                    .global-manual-copy-tip {{
+                        margin: 0;
+                        font-size: 13px;
+                        color: #374151;
+                    }}
+                    .global-manual-copy-text {{
+                        width: 100%;
+                        min-height: 128px;
+                        max-height: 48vh;
+                        border: 1px solid #d1d5db;
+                        border-radius: 8px;
+                        padding: 8px;
+                        font-size: 14px;
+                        line-height: 1.4;
+                        resize: vertical;
+                        box-sizing: border-box;
+                        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                    }}
+                    .global-manual-copy-actions {{
+                        display: flex;
+                        justify-content: flex-end;
+                    }}
+                    .global-manual-copy-close {{
+                        border: none;
+                        border-radius: 8px;
+                        padding: 8px 12px;
+                        font-size: 14px;
+                        font-weight: 600;
+                        color: #ffffff;
+                        background: #2563eb;
+                    }}
+                `;
+                targetDoc.head.appendChild(styleEl);
+            }}
+
+            const existing = targetDoc.getElementById('global_manual_copy_overlay');
+            if (existing && existing.parentNode) {{
+                existing.parentNode.removeChild(existing);
+            }}
+
+            const overlay = targetDoc.createElement('div');
+            overlay.id = 'global_manual_copy_overlay';
+            overlay.className = 'global-manual-copy-overlay';
+
+            const panel = targetDoc.createElement('div');
+            panel.className = 'global-manual-copy-panel';
+            overlay.appendChild(panel);
+
+            const title = targetDoc.createElement('p');
+            title.className = 'global-manual-copy-title';
+            title.textContent = '手动复制';
+            panel.appendChild(title);
+
+            const tip = targetDoc.createElement('p');
+            tip.className = 'global-manual-copy-tip';
+            tip.textContent = '自动复制失败，请长按下面文本并选择“复制”。';
+            panel.appendChild(tip);
+
+            const textarea = targetDoc.createElement('textarea');
+            textarea.className = 'global-manual-copy-text';
+            textarea.readOnly = true;
+            textarea.value = text;
+            panel.appendChild(textarea);
+
+            const actionWrap = targetDoc.createElement('div');
+            actionWrap.className = 'global-manual-copy-actions';
+            panel.appendChild(actionWrap);
+
+            const closeBtn = targetDoc.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.className = 'global-manual-copy-close';
+            closeBtn.textContent = '关闭';
+            actionWrap.appendChild(closeBtn);
+
+            function closeDialog() {{
+                if (overlay.parentNode) {{
+                    overlay.parentNode.removeChild(overlay);
+                }}
+            }}
+
+            closeBtn.addEventListener('click', closeDialog);
+            overlay.addEventListener('click', function (e) {{
+                if (e.target === overlay) {{
+                    closeDialog();
+                }}
+            }});
+
+            targetDoc.body.appendChild(overlay);
+            setTimeout(function() {{
+                textarea.focus({{ preventScroll: true }});
+                textarea.select();
+                textarea.setSelectionRange(0, textarea.value.length);
+            }}, 30);
+        }}
+
+        function isIOSLike(navObj) {{
+            const nav = navObj || navigator;
+            const ua = (nav.userAgent || '').toLowerCase();
+            const iOSUA = /iphone|ipad|ipod/.test(ua);
+            const iPadOS = nav.platform === 'MacIntel' && nav.maxTouchPoints > 1;
+            return iOSUA || iPadOS;
+        }}
+
+        function runExecCommandStrategies(targetDoc, preferRangeFirst) {{
+            if (preferRangeFirst) {{
+                return copyByExecCommandRange(targetDoc) || copyByExecCommandTextarea(targetDoc);
+            }}
+            return copyByExecCommandTextarea(targetDoc) || copyByExecCommandRange(targetDoc);
+        }}
+
+        function showManualCopyPrompt(targetDoc) {{
+            try {{
+                showManualCopyDialog(targetDoc);
+            }} catch (e) {{
+                try {{
+                    window.prompt('自动复制受限，请手动复制以下内容：', text);
+                }} catch (promptError) {{
+                    // 某些 WebView 可能禁用 prompt，保持静默
+                }}
+            }}
+        }}
+
+        try {{
+            const hostCtx = getCopyHostContext();
+            let copied = false;
+            const preferRangeFirst = isIOSLike(navigator) || isIOSLike(hostCtx.nav);
+
+            // 先走同步 execCommand 方案，尽量留在用户点击手势链路内（移动端更稳）。
+            copied = runExecCommandStrategies(document, preferRangeFirst);
+            if (!copied && hostCtx.doc !== document) {{
+                copied = runExecCommandStrategies(hostCtx.doc, preferRangeFirst);
+            }}
+
+            // 再尝试异步 Clipboard API。
+            if (!copied) {{
+                copied = await copyByClipboardApi(navigator, window);
+            }}
+            if (!copied && hostCtx.win !== window) {{
+                copied = await copyByClipboardApi(hostCtx.nav, hostCtx.win);
+            }}
+
+            if (!copied) {{
+                showManualCopyPrompt(hostCtx.doc || document);
+                try {{
+                    showGlobalToast({escaped_manual_message}, '#d97706', {error_duration});
+                }} catch (toastError) {{
+                    showTooltip({escaped_manual_message}, '#d97706', {error_duration});
+                }}
+                return;
             }}
 
             button.style.color = '#0e7c3a';
