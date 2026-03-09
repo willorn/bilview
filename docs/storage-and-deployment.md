@@ -37,3 +37,13 @@ streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 - 把 API Key 放到平台 Secret，不写死在仓库
 - 对外开放端口并配置网关/反向代理
 - 定期清理 `downloads/` 避免磁盘占满
+
+## Docker 部署
+
+项目已提供 `Dockerfile` 和 `docker-compose.yml`。
+
+```bash
+docker compose up -d --build
+```
+
+详细最佳实践请查看：[docker-deployment.md](docker-deployment.md)

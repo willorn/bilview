@@ -31,6 +31,19 @@ streamlit run app.py
 
 打开 `http://localhost:8501`，粘贴 B 站链接即可开始。
 
+## Docker 快速部署
+
+1) 配置 `.env`（至少包含 `X666_API_KEY`，建议同时配置 `GROQ_API_KEY`）
+
+2) 启动：
+```bash
+docker compose up -d --build
+```
+
+3) 访问：`http://localhost:8501`
+
+完整最佳实践请看：[Docker 部署最佳实践](docs/docker-deployment.md)
+
 ## 文档导航
 
 ### 新手优先
@@ -44,6 +57,7 @@ streamlit run app.py
 
 - [配置说明](docs/configuration.md)
 - [存储与部署](docs/storage-and-deployment.md)
+- [Docker 部署最佳实践](docs/docker-deployment.md)
 - [系统架构](docs/architecture.md)
 - [开发与测试](docs/development.md)
 - [默认总结 Prompt](docs/default_prompt.md)
