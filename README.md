@@ -62,6 +62,25 @@ docker compose up -d --build
 - [开发与测试](docs/development.md)
 - [默认总结 Prompt](docs/default_prompt.md)
 
+## 开发规范
+
+### ⚠️ 安全提交规则（重要！）
+
+在提交代码前，**必须**检查是否包含敏感信息：
+
+```bash
+# 检查 IP 地址、密码等敏感信息
+git diff --cached | grep -E "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b"
+git diff --cached | grep -iE "(password|secret|key|token)\"?\s*[=:]\s*\"?[^\"\s]{8,}"
+```
+
+**禁止提交的内容**：
+- 服务器 IP 地址
+- 密码、API Keys、密钥
+- 生产环境凭据
+
+详细规则请查看：[.trae/rules/project_rules.md](.trae/rules/project_rules.md)
+
 ## License
 
 [MIT](LICENSE)
