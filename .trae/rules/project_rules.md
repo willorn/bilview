@@ -101,16 +101,6 @@ chmod +x .git/hooks/pre-commit
 - `feature/*`: 功能分支
 - `fix/*`: 修复分支
 
-### 部署相关
-
-所有部署相关文件放在 `deploy/` 目录：
-- `Dockerfile` - Docker 镜像配置
-- `docker-compose.yml` - 服务编排
-- `deploy.sh` - 部署脚本
-- `deploy_remote.py` - 远程部署脚本
-- `README.md` - 部署文档
-
----
 
 ## 历史教训
 
