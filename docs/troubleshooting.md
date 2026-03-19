@@ -32,7 +32,6 @@ python -m streamlit run app.py
 处理：
 - 先换一个较短视频验证链路
 - 网络稳定后重试
-- 必要时切换 `ASR_PROVIDER=local_whisper`
 
 ## 5) `localhost:8501` 打不开
 

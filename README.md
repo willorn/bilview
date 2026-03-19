@@ -45,6 +45,7 @@ streamlit run app.py
 - [配置说明](docs/configuration.md)
 - [存储与部署](docs/storage-and-deployment.md)
 - [系统架构](docs/architecture.md)
+- [实现细节](docs/implementation.md)
 - [开发与测试](docs/development.md)
 - [默认总结 Prompt](docs/default_prompt.md)
 

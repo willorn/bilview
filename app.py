@@ -60,10 +60,6 @@ from utils.copy_button import create_copy_button_with_tooltip, create_task_copy_
 from utils.file_helper import ensure_dir
 
 DB_AUTO_INIT_ON_STARTUP = bool(getattr(app_config, "DB_AUTO_INIT_ON_STARTUP", False))
-DEFAULT_ASR_PROVIDER = (
-    str(getattr(app_config, "DEFAULT_ASR_PROVIDER", "groq")).strip().lower()
-    or "groq"
-)
 DEFAULT_GROQ_ASR_MODEL = (
     str(getattr(app_config, "DEFAULT_GROQ_ASR_MODEL", "whisper-large-v3-turbo")).strip()
     or "whisper-large-v3-turbo"
@@ -107,9 +103,7 @@ REGEN_RUNNING_TASK_SESSION_KEY = "regen_running_task_id"
 TASK_TEXT_CACHE_SESSION_KEY = "task_text_cache"
 DB_SCHEMA_READY_SESSION_KEY = "db_schema_ready"
 DB_SCHEMA_ERROR_SESSION_KEY = "db_schema_error"
-TRANSCRIBE_PROVIDER = DEFAULT_ASR_PROVIDER
 TRANSCRIBE_API_MODEL = DEFAULT_GROQ_ASR_MODEL
-TRANSCRIBE_LOCAL_MODEL_SIZE = "medium"
 TRANSCRIBE_TEXT_PROMPT = (
     "请输出简体中文逐字稿，并尽量补全自然中文标点符号；"
     "不要添加任何解释或额外内容。"
@@ -638,9 +632,7 @@ def _process_task(task_id: int, url: str, system_prompt: Optional[str]) -> None:
 
         raw_transcript = audio_to_text(
             audio_path,
-            provider=TRANSCRIBE_PROVIDER,
             asr_model=TRANSCRIBE_API_MODEL,
-            model_size=TRANSCRIBE_LOCAL_MODEL_SIZE,
             language="zh",
             transcription_prompt=TRANSCRIBE_TEXT_PROMPT,
             progress_callback=on_chunk_completed,
@@ -1606,9 +1598,7 @@ def _run_transcription_flow(task: Task, restart_from_scratch: bool) -> None:
             # 调用转写
             raw_transcript = audio_to_text(
                 audio_path,
-                provider=TRANSCRIBE_PROVIDER,
                 asr_model=TRANSCRIBE_API_MODEL,
-                model_size=TRANSCRIBE_LOCAL_MODEL_SIZE,
                 language="zh",
                 transcription_prompt=TRANSCRIBE_TEXT_PROMPT,
                 progress_callback=on_chunk_completed,

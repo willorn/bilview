@@ -16,7 +16,7 @@ GROQ_API_KEY=your_groq_key
 
 | 变量名 | 用途 | 默认值 |
 | --- | --- | --- |
-| `ASR_PROVIDER` | 转写模式 | `groq`（可选 `local_whisper`） |
+| `ASR_PROVIDER` | 转写模式 | `groq` |
 | `GROQ_API_KEYS` | 多 Key 轮询（逗号分隔） | 空 |
 | `BILVIEW_STORAGE_DIR` | 自定义存储目录 | 自动选择 |
 | `DB_AUTO_INIT_ON_STARTUP` | 启动自动初始化 DB | `0` |

@@ -21,18 +21,12 @@ from pydub import AudioSegment
 import config as app_config
 from core.speech_recognition import create_speech_recognizer
 
-DEFAULT_MODEL_SIZE = "base"
-DEFAULT_PROVIDER = (
-    str(getattr(app_config, "DEFAULT_ASR_PROVIDER", "groq")).strip().lower()
-    or "groq"
-)
 DEFAULT_ASR_MODEL = (
     str(getattr(app_config, "DEFAULT_GROQ_ASR_MODEL", "whisper-large-v3-turbo")).strip()
     or "whisper-large-v3-turbo"
 )
 CHUNK_DURATION_SECONDS = 300  # 每段 5 分钟，兼顾稳定性与性能
 FILE_SIZE_LIMIT_MB = 25
-GROQ_PROVIDER = "groq"
 GROQ_CHUNK_FORMAT = "mp3"
 GROQ_CHUNK_SUFFIX = ".mp3"
 GROQ_CHUNK_BITRATE = "64k"
@@ -40,33 +34,27 @@ GROQ_CHUNK_BITRATE = "64k"
 
 def audio_to_text(
     file_path: Path | str,
-    model_size: str = DEFAULT_MODEL_SIZE,
     language: Optional[str] = None,
     transcription_prompt: Optional[str] = None,
     chunk_duration_sec: int = CHUNK_DURATION_SECONDS,
     file_size_limit_mb: int = FILE_SIZE_LIMIT_MB,
-    device: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, str, float, float], None]] = None,
     resume_from_chunks: Optional[List[Dict[str, Any]]] = None,
-    provider: str = DEFAULT_PROVIDER,
     asr_model: str = DEFAULT_ASR_MODEL,
     api_keys: Optional[Sequence[str]] = None,
 ) -> str:
     """
-    将音频文件转录为文本（支持 Groq / 本地 Whisper）。
+    将音频文件转录为文本（使用 Groq 云端 Whisper API）。
 
     Args:
         file_path: 输入音频文件路径。
-        model_size: 本地 Whisper 模型规格（provider=local_whisper 时生效）。
         language: 可选语言代码，None 时交由 Whisper 自动检测。
         transcription_prompt: 可选转写提示词（用于引导模型补充标点等风格）。
         chunk_duration_sec: 切片时长阈值（秒），超过则分片转录。
         file_size_limit_mb: 文件大小阈值（MB），超过则分片转录。
-        device: 本地推理设备（'cuda'/'mps'/'cpu'），None 时自动选择。
         progress_callback: 进度回调函数，签名为 (current, total, chunk_text, start_sec, end_sec)。
         resume_from_chunks: 断点续传数据，包含已完成切片的信息。
-        provider: 语音识别 provider，默认 `groq`。
-        asr_model: Groq 语音模型名（provider=groq 时生效）。
+        asr_model: Groq 语音模型名。
         api_keys: 可选 API Key 列表（用于覆盖默认配置，支持轮询）。
 
     Returns:
@@ -82,9 +70,6 @@ def audio_to_text(
 
     try:
         recognizer = create_speech_recognizer(
-            provider=provider,
-            model_size=model_size,
-            device=device,
             groq_model=asr_model,
             groq_api_keys=api_keys,
         )
@@ -116,7 +101,9 @@ def audio_to_text(
         segments = _split_audio(audio, chunk_duration_sec)
         total_chunks = len(segments)
         texts: List[str] = []
-        chunk_format, chunk_suffix, export_kwargs = _resolve_chunk_export(provider)
+        chunk_format = GROQ_CHUNK_FORMAT
+        chunk_suffix = GROQ_CHUNK_SUFFIX
+        export_kwargs = {"bitrate": GROQ_CHUNK_BITRATE}
 
         # 断点续传：跳过已完成切片
         start_index = 0
@@ -188,12 +175,6 @@ def _transcribe_with_optional_prompt(
             raise
         return recognizer.transcribe_file(file_path, language=language)
 
-
-def _resolve_chunk_export(provider: str) -> tuple[str, str, Dict[str, str]]:
-    """根据 provider 选择临时分片的导出格式。"""
-    if provider.strip().lower() == GROQ_PROVIDER:
-        return GROQ_CHUNK_FORMAT, GROQ_CHUNK_SUFFIX, {"bitrate": GROQ_CHUNK_BITRATE}
-    return "wav", ".wav", {}
 
 
 def _is_payload_too_large_error(exc: Exception) -> bool:

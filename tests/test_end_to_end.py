@@ -1,7 +1,8 @@
 """
 端到端测试：模拟完整的转写流程，包括进度回调和断点续传。
 
-注意：此测试需要实际的音频文件。如果没有，会创建一个测试音频。
+注意：此测试需要 GROQ_API_KEY 环境变量。
+测试音频为正弦波（无语音内容），转写结果为空是正常的。
 """
 import tempfile
 from pathlib import Path
@@ -81,11 +82,9 @@ def test_normal_transcription():
 
             callback_calls.append((current, total, text, start_sec, end_sec))
 
-        # 执行转写
+        # 执行转写（需要 GROQ_API_KEY 环境变量）
         transcript = audio_to_text(
             audio_path,
-            provider="local_whisper",
-            model_size="tiny",
             progress_callback=progress_callback
         )
 
@@ -181,11 +180,9 @@ def test_chunked_transcription():
 
             callback_calls.append((current, total))
 
-        # 执行转写
+        # 执行转写（需要 GROQ_API_KEY 环境变量）
         transcript = audio_to_text(
             audio_path,
-            provider="local_whisper",
-            model_size="tiny",
             chunk_duration_sec=300,  # 5 分钟切片
             progress_callback=progress_callback
         )
@@ -295,11 +292,9 @@ def test_resume_from_checkpoint():
                 db_path=db_path
             )
 
-        # 从断点继续转写
+        # 从断点继续转写（需要 GROQ_API_KEY 环境变量）
         transcript = audio_to_text(
             audio_path,
-            provider="local_whisper",
-            model_size="tiny",
             chunk_duration_sec=300,
             progress_callback=progress_callback,
             resume_from_chunks=resume_chunks  # 关键：传入断点数据

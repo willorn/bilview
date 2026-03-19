@@ -20,12 +20,17 @@ def test_api_key_round_robin() -> None:
     assert picked == ["k1", "k2", "k3", "k1", "k2"]
 
 
-def test_create_speech_recognizer_fallback_to_local() -> None:
-    recognizer = speech_recognition.create_speech_recognizer(
-        provider="groq",
-        groq_api_keys=[],
-    )
-    assert isinstance(recognizer, speech_recognition.LocalWhisperSpeechRecognizer)
+def test_create_speech_recognizer_requires_api_key() -> None:
+    try:
+        speech_recognition.create_speech_recognizer(groq_api_keys=[])
+        assert False, "应抛出 ValueError"
+    except ValueError as exc:
+        assert "未配置" in str(exc)
+
+
+def test_create_speech_recognizer_returns_groq_recognizer() -> None:
+    recognizer = speech_recognition.create_speech_recognizer(groq_api_keys=["test-key"])
+    assert isinstance(recognizer, speech_recognition.GroqSpeechRecognizer)
 
 
 def test_groq_recognizer_key_failover(monkeypatch) -> None:
