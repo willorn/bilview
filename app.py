@@ -8,6 +8,38 @@ Streamlit 前端：负责输入、状态提示、历史记录与结果展示。
 """
 from __future__ import annotations
 
+# Python 3.13 移除了 audioop，pydub 依赖不存在的 pyaudioop。
+# 在所有其他导入之前抢先注册本地兼容层。
+import sys
+from types import ModuleType
+_pyaudioop = ModuleType("pyaudioop")
+
+def _rms(audio_data: bytes, width: int) -> float:
+    import struct
+    if not audio_data:
+        return 0.0
+    if width == 1:
+        samples = [s - 128 for s in struct.unpack(f"{len(audio_data)}B", audio_data)]
+    elif width == 2:
+        samples = struct.unpack(f"<{len(audio_data)//2}h", audio_data)
+    elif width == 3:
+        total = 0.0
+        n = len(audio_data) // 3
+        for i in range(n):
+            b0, b1, b2 = audio_data[i*3], audio_data[i*3+1], audio_data[i*3+2]
+            val = b0 | (b1 << 8) | ((b2 << 24) >> 8)
+            total += val * val
+        return (total / n) ** 0.5 if n else 0.0
+    elif width == 4:
+        samples = struct.unpack(f"<{len(audio_data)//4}i", audio_data)
+    else:
+        return 0.0
+    total = sum(s * s for s in samples)
+    return (total / len(samples)) ** 0.5 if samples else 0.0
+
+_pyaudioop.rms = _rms
+sys.modules["pyaudioop"] = _pyaudioop
+
 import html
 import logging
 import re
@@ -27,6 +59,13 @@ from utils.url_helper import process_user_input
 from core.downloader import download_audio
 from core.punctuator import punctuate_transcript
 from core import summarizer as summarizer_module
+from core.downloader import (
+    has_bilibili_cookies,
+    COOKIE_FILE,
+    generate_bilibili_qr,
+    check_bilibili_login_status,
+    get_cookie_receive_url,
+)
 from core.transcriber import audio_to_text
 from db.database import (
     DEFAULT_DB_PATH,
@@ -483,6 +522,8 @@ def main() -> None:
     if "running_task_id" not in st.session_state:
         st.session_state.running_task_id = None
 
+    _auto_refresh_fragment()
+
     title_col, tools_col = st.columns([6, 2], vertical_alignment="top")
     with title_col:
         st.title("Bilibili Video Transcription and Summary")
@@ -712,6 +753,71 @@ def _render_running_task(task_id: int) -> Optional[str]:
     st.session_state.running_task_id = None
     _notify_task_result(task)
     return None
+
+
+def _has_active_tasks() -> bool:
+    """检查是否存在尚未完成的任务。"""
+    try:
+        tasks = list_tasks(limit=100, include_content=False)
+        active_statuses = {
+            TaskStatus.WAITING.value,
+            TaskStatus.DOWNLOADING.value,
+            TaskStatus.TRANSCRIBING.value,
+            TaskStatus.SUMMARIZING.value,
+        }
+        return any(t.status in active_statuses for t in tasks)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@st.fragment
+def _auto_refresh_fragment() -> None:
+    """
+    页面自动刷新组件。
+    - 检测到有活跃任务时，注入 JS 每 3 秒自动刷新页面（保证状态实时）。
+    - 监听 Page Visibility API，手机切回前台时立即刷新。
+    - 任务全部完成后自动停止刷新。
+    """
+    has_active = _has_active_tasks()
+
+    if has_active:
+        st.query_params["__ar"] = "1"
+    elif "__ar" in st.query_params:
+        del st.query_params["__ar"]
+
+    poll_script = """
+    <script>
+    (function() {
+        // 页面可见性监听：切回前台立即刷新（手机切后台再切回来时触发）
+        document.addEventListener("visibilitychange", function() {
+            if (document.visibilityState === "visible") {
+                var url = new URL(window.location.href);
+                if (!url.searchParams.has("__ar") || url.searchParams.get("__ar") === "1") {
+                    var ts = new Date().getTime();
+                    var cleanUrl = window.location.pathname + "?__ar=1&t=" + ts + window.location.hash;
+                    window.location.replace(cleanUrl);
+                }
+            }
+        });
+
+        // 定期轮询：活跃任务存在时每 3 秒刷新一次
+        function scheduleReload() {
+            var url = new URL(window.location.href);
+            if (!url.searchParams.has("__ar") || url.searchParams.get("__ar") !== "1") return;
+
+            setTimeout(function() {
+                var ts = new Date().getTime();
+                var cleanUrl = window.location.pathname + "?__ar=1&t=" + ts + window.location.hash;
+                window.location.replace(cleanUrl);
+            }, 3000);
+        }
+
+        // 页面加载时立即开始轮询（如果 query param 标记了活跃状态）
+        scheduleReload();
+    })();
+    </script>
+    """
+    components.html(poll_script, height=0, scrolling=False)
 
 
 def _render_history(default_task_id: Optional[int] = None) -> None:
@@ -1214,9 +1320,179 @@ def _render_transcript_reader(transcript_text: str) -> None:
     )
 
 
+def _render_bilibili_login() -> None:
+    """B站扫码登录组件。"""
+    with st.expander("🔑 B站登录", expanded=False):
+        if has_bilibili_cookies():
+            st.success("✅ Cookies 已配置，可以下载大多数视频")
+            st.caption(f"保存路径：{COOKIE_FILE}")
+            st.caption("💡 会员视频需要有效的 Cookies，普通视频一般无需登录")
+            if st.button("清除 Cookies", use_container_width=True):
+                if COOKIE_FILE.is_file():
+                    COOKIE_FILE.unlink()
+                st.rerun()
+            return
+
+        st.warning("未配置 Cookies，部分视频可能下载失败（HTTP 412/403）")
+
+        if st.button("📱 扫码登录B站", use_container_width=True, key="bili_qr_start"):
+            try:
+                qr_data = generate_bilibili_qr()
+                oauth_key = qr_data["oauth_key"]
+                qr_url = qr_data["url"]
+                callback_url = get_cookie_receive_url()
+            except Exception as exc:
+                st.error(f"生成二维码失败：{exc}")
+                return
+
+            # 生成二维码图片
+            try:
+                import qrcode, io
+                img = qrcode.make(qr_url)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                qr_bytes = buf.getvalue()
+            except Exception as exc:
+                st.error(f"生成二维码图片失败：{exc}")
+                return
+
+            st.session_state.bili_qr_oauth_key = oauth_key
+            st.session_state.bili_callback_url = callback_url
+            st.session_state.bili_qr_polling = True
+
+        if st.session_state.get("bili_qr_polling"):
+            oauth_key = st.session_state.get("bili_qr_oauth_key", "")
+            callback_url = st.session_state.get("bili_callback_url", "")
+
+            st.info("📱 请用 B站App 扫码登录（点击二维码 → 相册选图）")
+            try:
+                import qrcode, io
+                img = qrcode.make(
+                    "https://passport.bilibili.com/qrcode/h5/login?oauthKey=" + oauth_key
+                )
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                qr_bytes = buf.getvalue()
+                st.image(qr_bytes, width=220, caption="请用 B站App 扫码")
+            except Exception:
+                st.text("oauthKey: " + oauth_key)
+
+            # 浏览器端轮询 + 自动刷新
+            poll_script = f"""
+            <div id="bili-login-status" style="padding:8px 0;font-family:sans-serif">
+                ⏳ 等待扫码确认...
+            </div>
+            <div id="bili-error" style="color:#ff6b6b;padding:4px 0;display:none"></div>
+            <script>
+            (function() {{
+                var oauthKey = "{oauth_key}";
+                var callbackUrl = "{callback_url}";
+                var POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll";
+                var TIMEOUT = 90;
+                var start = Date.now();
+
+                function poll() {{
+                    if (Date.now() - start > TIMEOUT * 1000) {{
+                        document.getElementById("bili-login-status").textContent = "⏰ 扫码超时，请重新点击「扫码登录」";
+                        return;
+                    }}
+
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("POST", POLL_URL, true);
+                    xhr.setRequestHeader("Content-Type", "application/json");
+                    xhr.setRequestHeader("Referer", "https://www.bilibili.com/");
+                    xhr.onload = function() {{
+                        try {{
+                            var d = JSON.parse(xhr.responseText);
+                            var code = (d.data && d.data.code) || d.data;
+                            var statusEl = document.getElementById("bili-login-status");
+                            if (code == 86100) {{
+                                statusEl.textContent = "📱 请用 B站App 扫码...";
+                                setTimeout(poll, 1000);
+                            }} else if (code == 86038) {{
+                                statusEl.textContent = "✅ 已扫码，请在手机端确认";
+                                setTimeout(poll, 1000);
+                            }} else if (code == 86090) {{
+                                var url = d.data && d.data.url || "";
+                                var cookies = parseCookies(url);
+                                statusEl.textContent = "🎉 登录成功！正在保存 Cookies...";
+                                // 发送 cookies 到我们的服务器
+                                if (cookies) {{
+                                    var postXhr = new XMLHttpRequest();
+                                    postXhr.open("POST", callbackUrl, true);
+                                    postXhr.setRequestHeader("Content-Type", "application/json");
+                                    postXhr.onload = function() {{
+                                        setTimeout(function() {{ window.location.reload(); }}, 1500);
+                                    }};
+                                    postXhr.onerror = function() {{
+                                        // 即使回调失败，cookies 可能已保存
+                                        setTimeout(function() {{ window.location.reload(); }}, 1500);
+                                    }};
+                                    postXhr.send(JSON.stringify({{cookies: cookies}}));
+                                }} else {{
+                                    setTimeout(function() {{ window.location.reload(); }}, 1500);
+                                }}
+                            }} else if (code == -2) {{
+                                statusEl.textContent = "⏰ 二维码已过期，请重新扫码";
+                            }} else {{
+                                statusEl.textContent = "登录状态: " + code + "，请重新扫码";
+                            }}
+                        }} catch(e) {{
+                            document.getElementById("bili-login-status").textContent = "轮询异常，重试中...";
+                            setTimeout(poll, 2000);
+                        }}
+                    }};
+                    xhr.onerror = function() {{
+                        document.getElementById("bili-login-status").textContent = "网络异常，2秒后重试...";
+                        setTimeout(poll, 2000);
+                    }};
+                    xhr.send(JSON.stringify({{oauthKey: oauthKey, source: "main", scopes: "login"}}));
+                }}
+
+                function parseCookies(url) {{
+                    try {{
+                        var cookies = {{}};
+                        // 从 URL hash 中提取
+                        var hash = url.split("#")[1] || "";
+                        hash.split("&").forEach(function(p) {{
+                            var kv = p.split("=");
+                            if (kv[0] && kv[1]) cookies[kv[0]] = decodeURIComponent(kv[1]);
+                        }});
+                        if (Object.keys(cookies).length > 0) {{
+                            var lines = ["# Netscape HTTP Cookie File", "# Generated by BilView"];
+                            var expire = Math.floor(Date.now()/1000) + 25*24*3600;
+                            for (var k in cookies) {{
+                                if (["SESSDATA","bili_jct","DedeUserID","DedeUserID__ckMd5","sid"].indexOf(k) >= 0) {{
+                                    lines.push(".bilibili.com\\tTRUE\\t/\\tTRUE\\t" + expire + "\\t" + k + "\\t" + cookies[k]);
+                                }}
+                            }}
+                            return lines.join("\\n");
+                        }}
+                    }} catch(e) {{}}
+                    return "";
+                }}
+
+                poll();
+            }})();
+            </script>
+            """
+            st.components.v1.html(poll_script, height=80, scrolling=False)
+
+            if st.button("取消扫码", key="bili_qr_cancel"):
+                st.session_state.bili_qr_polling = False
+                st.rerun()
+        else:
+            st.caption(
+                "💡 点击后用 B站App 扫码，确认后自动保存，无需手动上传文件。"
+            )
+
+
 def _render_settings(show_title: bool = True) -> None:
     if show_title:
         st.subheader("设置与清理")
+
+    _render_bilibili_login()
+
     with st.expander("数据库维护", expanded=False):
         auto_init_text = "开启" if DB_AUTO_INIT_ON_STARTUP else "关闭"
         st.caption(f"启动时自动初始化：{auto_init_text}（环境变量：DB_AUTO_INIT_ON_STARTUP）")
