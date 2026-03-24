@@ -34,6 +34,7 @@ DEFAULT_MODEL = DEFAULT_LLM_MODEL
 DEFAULT_API_KEY = None  # 不再内置默认密钥，必须由环境变量或显式传入
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TIMEOUT_SECONDS = 150
+DEFAULT_MAX_TOKENS = 8192  # 默认最大输出 token 数
 RATE_LIMIT_SECONDS = 10  # Token Bucket 补充间隔（秒）
 BURST_SIZE = 3  # 允许的突发请求数
 DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent.parent / "docs" / "default_prompt.md"
@@ -119,6 +120,7 @@ def generate_summary(
     model: str = DEFAULT_MODEL,
     api_key: Optional[str] = None,
     temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     api_url: str = DEFAULT_API_URL,
 ) -> str:
@@ -131,6 +133,7 @@ def generate_summary(
         model: 模型名称。
         api_key: API 密钥，默认优先读取环境变量 X666_API_KEY，其次使用文档提供的默认 key。
         temperature: 采样温度。
+        max_tokens: 最大输出 token 数。
         timeout: 单次请求超时时间（秒）。
         api_url: Chat Completions 接口地址。
 
@@ -149,6 +152,7 @@ def generate_summary(
             {"role": "user", "content": sanitized_text},
         ],
         "temperature": temperature,
+        "max_tokens": max_tokens,
     }
     chosen_key = api_key or _get_env_key() or DEFAULT_API_KEY
     if not chosen_key:
