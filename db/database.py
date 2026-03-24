@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -19,6 +20,13 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence
+
+# 设置时区为北京时区（Asia/Shanghai）
+os.environ["TZ"] = "Asia/Shanghai"
+try:
+    time.tzset()
+except AttributeError:
+    pass  # Windows 不支持 tzset
 
 from config import (
     CLOUDFLARE_ACCOUNT_ID,

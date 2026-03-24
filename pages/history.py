@@ -4,12 +4,21 @@
 from __future__ import annotations
 
 import math
+import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from urllib.parse import urlencode
 
 import streamlit as st
+
+# 设置时区为北京时区（Asia/Shanghai）
+os.environ["TZ"] = "Asia/Shanghai"
+try:
+    import time as _time_module
+    _time_module.tzset()
+except (AttributeError, ImportError):
+    pass
 
 from db.database import (
     Task,
@@ -284,7 +293,11 @@ def _format_created_at(raw_time: str) -> str:
         return "-"
     normalized = raw_time.strip().replace("T", " ").replace("Z", "")
     try:
+        # 尝试解析为无时区的 ISO 格式，然后强制使用北京时区
         parsed = datetime.fromisoformat(normalized)
+        beijing_tz = timezone(timedelta(hours=8))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=beijing_tz)
         return parsed.strftime("%m-%d %H:%M")
     except ValueError:
         return normalized[:16]

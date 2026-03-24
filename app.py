@@ -14,31 +14,254 @@ import sys
 from types import ModuleType
 _pyaudioop = ModuleType("pyaudioop")
 
-def _rms(audio_data: bytes, width: int) -> float:
+def _unpack_samples(audio_data: bytes, width: int):
+    """将音频数据解包为样本列表。"""
     import struct
-    if not audio_data:
-        return 0.0
     if width == 1:
-        samples = [s - 128 for s in struct.unpack(f"{len(audio_data)}B", audio_data)]
+        return list(struct.unpack(f"{len(audio_data)}B", audio_data))
     elif width == 2:
-        samples = struct.unpack(f"<{len(audio_data)//2}h", audio_data)
+        return list(struct.unpack(f"<{len(audio_data)//2}h", audio_data))
     elif width == 3:
-        total = 0.0
+        samples = []
         n = len(audio_data) // 3
         for i in range(n):
             b0, b1, b2 = audio_data[i*3], audio_data[i*3+1], audio_data[i*3+2]
             val = b0 | (b1 << 8) | ((b2 << 24) >> 8)
-            total += val * val
-        return (total / n) ** 0.5 if n else 0.0
+            if val >= 0x800000:
+                val -= 0x1000000
+            samples.append(val)
+        return samples
     elif width == 4:
-        samples = struct.unpack(f"<{len(audio_data)//4}i", audio_data)
-    else:
+        return list(struct.unpack(f"<{len(audio_data)//4}i", audio_data))
+    return []
+
+
+def _pack_samples(samples: list, width: int) -> bytes:
+    """将样本列表打包为音频数据。"""
+    import struct
+    if width == 1:
+        return struct.pack(f"{len(samples)}B", *samples)
+    elif width == 2:
+        return struct.pack(f"<{len(samples)}h", *samples)
+    elif width == 3:
+        result = bytearray()
+        for val in samples:
+            val = max(-8388608, min(8388607, val))
+            if val < 0:
+                val += 0x1000000
+            result.append(val & 0xFF)
+            result.append((val >> 8) & 0xFF)
+            result.append((val >> 16) & 0xFF)
+        return bytes(result)
+    elif width == 4:
+        return struct.pack(f"<{len(samples)}i", *samples)
+    return b""
+
+
+def _rms(audio_data: bytes, width: int) -> float:
+    if not audio_data:
+        return 0.0
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
         return 0.0
     total = sum(s * s for s in samples)
-    return (total / len(samples)) ** 0.5 if samples else 0.0
+    return (total / len(samples)) ** 0.5
+
+
+def _mul(audio_data: bytes, width: int, factor: float) -> bytes:
+    if not audio_data or factor == 1.0:
+        return audio_data
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return audio_data
+    if width == 1:
+        result = [int(max(0, min(255, s * factor))) for s in samples]
+    elif width == 2:
+        result = [int(max(-32768, min(32767, s * factor))) for s in samples]
+    elif width == 3:
+        result = [int(max(-8388608, min(8388607, s * factor))) for s in samples]
+    elif width == 4:
+        result = [int(max(-2147483648, min(2147483647, s * factor))) for s in samples]
+    else:
+        return audio_data
+    return _pack_samples(result, width)
+
+
+def _add(data1: bytes, data2: bytes, width: int) -> bytes:
+    """将两个音频数据相加。"""
+    import struct
+    if len(data1) != len(data2):
+        max_len = max(len(data1), len(data2))
+        data1 = data1.ljust(max_len, b'\x00')
+        data2 = data2.ljust(max_len, b'\x00')
+    samples1 = _unpack_samples(data1[:len(data2)], width)
+    samples2 = _unpack_samples(data2[:len(data1)], width)
+    min_len = min(len(samples1), len(samples2))
+    if width == 1:
+        result = [(samples1[i] + samples2[i]) & 0xFF for i in range(min_len)]
+    elif width == 2:
+        result = [max(-32768, min(32767, samples1[i] + samples2[i])) for i in range(min_len)]
+    elif width == 3:
+        result = [max(-8388608, min(8388607, samples1[i] + samples2[i])) for i in range(min_len)]
+    elif width == 4:
+        result = [max(-2147483648, min(2147483647, samples1[i] + samples2[i])) for i in range(min_len)]
+    else:
+        return data1
+    return _pack_samples(result[:min_len], width)
+
+
+def _avg(audio_data: bytes, width: int) -> int:
+    """返回音频样本的平均值。"""
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return 0
+    return int(sum(samples) / len(samples))
+
+
+def _bias(audio_data: bytes, width: int, bias: int) -> bytes:
+    """给音频数据添加直流偏移。"""
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return audio_data
+    if width == 1:
+        result = [(s + bias) & 0xFF for s in samples]
+    elif width == 2:
+        result = [max(-32768, min(32767, s + bias)) for s in samples]
+    elif width == 3:
+        result = [max(-8388608, min(8388607, s + bias)) for s in samples]
+    elif width == 4:
+        result = [max(-2147483648, min(2147483647, s + bias)) for s in samples]
+    else:
+        return audio_data
+    return _pack_samples(result, width)
+
+
+def _lin2lin(audio_data: bytes, width: int, new_width: int) -> bytes:
+    """转换采样宽度。"""
+    if width == new_width:
+        return audio_data
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return audio_data
+    if new_width == 1:
+        result = [max(0, min(255, s >> 8)) for s in samples]
+    elif new_width == 2:
+        result = [max(-32768, min(32767, s << 8)) for s in samples]
+    elif new_width == 3:
+        result = [max(-8388608, min(8388607, s << (8 * (3 - width)))) for s in samples]
+    elif new_width == 4:
+        result = [s << (8 * (4 - width)) for s in samples]
+    else:
+        return audio_data
+    return _pack_samples(result, new_width)
+
+
+def _max(audio_data: bytes, width: int) -> int:
+    """返回音频样本的最大绝对值。"""
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return 0
+    return max(abs(s) for s in samples)
+
+
+def _reverse(audio_data: bytes, width: int) -> bytes:
+    """反转音频数据。"""
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return audio_data
+    return _pack_samples(list(reversed(samples)), width)
+
+
+def _tomono(audio_data: bytes, width: int, l_factor: float, r_factor: float) -> bytes:
+    """将立体声数据转换为单声道。"""
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return audio_data
+    if width == 1:
+        result = [int(max(0, min(255, (s * l_factor + s * r_factor) / 2))) for s in samples]
+    elif width == 2:
+        result = [int(max(-32768, min(32767, (s * l_factor + s * r_factor) / 2))) for s in samples]
+    elif width == 3:
+        result = [int(max(-8388608, min(8388607, (s * l_factor + s * r_factor) / 2))) for s in samples]
+    elif width == 4:
+        result = [int(max(-2147483648, min(2147483647, (s * l_factor + s * r_factor) / 2))) for s in samples]
+    else:
+        return audio_data
+    return _pack_samples(result, width)
+
+
+def _tostereo(audio_data: bytes, width: int, l_factor: float, r_factor: float) -> bytes:
+    """将单声道数据转换为立体声。"""
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return audio_data
+    result = []
+    if width == 1:
+        for s in samples:
+            result.append(int(max(0, min(255, s * l_factor))))
+            result.append(int(max(0, min(255, s * r_factor))))
+    elif width == 2:
+        for s in samples:
+            result.append(max(-32768, min(32767, int(s * l_factor))))
+            result.append(max(-32768, min(32767, int(s * r_factor))))
+    elif width == 3:
+        for s in samples:
+            result.append(max(-8388608, min(8388607, int(s * l_factor))))
+            result.append(max(-8388608, min(8388607, int(s * r_factor))))
+    elif width == 4:
+        for s in samples:
+            result.append(max(-2147483648, min(2147483647, int(s * l_factor))))
+            result.append(max(-2147483648, min(2147483647, int(s * r_factor))))
+    else:
+        return audio_data
+    return _pack_samples(result, width)
+
+
+def _ratecv(audio_data: bytes, width: int, rate1: int, state1: tuple, rate2: int, state2: tuple):
+    """转换采样率。简单的整数倍重采样。"""
+    if rate1 == rate2 or not audio_data:
+        return audio_data, state1, state2
+    ratio = rate2 / rate1
+    samples = _unpack_samples(audio_data, width)
+    if not samples:
+        return audio_data, state1, state2
+    if ratio > 1:
+        new_len = int(len(samples) * ratio)
+        result = []
+        for i in range(new_len):
+            src_idx = int(i / ratio)
+            if src_idx < len(samples):
+                result.append(samples[src_idx])
+            else:
+                result.append(samples[-1] if samples else 0)
+    else:
+        step = 1 / ratio
+        result = []
+        i = 0
+        while i < len(samples):
+            result.append(samples[int(i)])
+            i += step
+    return _pack_samples(result, width), state1, state2
+
 
 _pyaudioop.rms = _rms
+_pyaudioop.mul = _mul
+_pyaudioop.add = _add
+_pyaudioop.avg = _avg
+_pyaudioop.bias = _bias
+_pyaudioop.lin2lin = _lin2lin
+_pyaudioop.max = _max
+_pyaudioop.reverse = _reverse
+_pyaudioop.tomono = _tomono
+_pyaudioop.tostereo = _tostereo
+_pyaudioop.ratecv = _ratecv
 sys.modules["pyaudioop"] = _pyaudioop
+
+# 设置时区为北京时区（Asia/Shanghai）
+import os
+os.environ["TZ"] = "Asia/Shanghai"
+import time as _time_module
+_time_module.tzset()
 
 import html
 import logging
