@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -33,31 +34,23 @@ from config import (
     CLOUDFLARE_API_TOKEN,
     CLOUDFLARE_D1_DATABASE_ID,
     DB_PATH,
-    TURSO_AUTH_TOKEN,
-    TURSO_DATABASE_URL,
-    TURSO_LOCAL_REPLICA_PATH,
+    SUPABASE_POSTGRES_URL,
+    SOCKS5_PROXY,
 )
 
 try:
-    import libsql  # type: ignore
-except ImportError:  # pragma: no cover - 由运行环境决定是否安装 libsql
-    libsql = None
+    import psycopg2
+    import psycopg2.extras
+except ImportError:  # pragma: no cover - 由运行环境决定是否安装 psycopg2
+    psycopg2 = None
 
 CONNECTION_TIMEOUT_SECONDS = 30
 HTTP_CONNECTION_TIMEOUT_SECONDS = 30
 DATA_DIR_NAME = "data"
 DB_FILE_NAME = "app.db"
 DEFAULT_DB_PATH = DB_PATH
-REMOTE_DB_SCHEMES = ("libsql://", "https://", "http://")
+REMOTE_DB_SCHEMES = ("https://", "http://")
 D1_API_BASE_URL = "https://api.cloudflare.com/client/v4"
-TURSO_SYNC_INTERVAL_SECONDS = 15.0
-TURSO_SYNC_FAILURE_BACKOFF_SECONDS = 60.0
-TURSO_SYNC_FAILURE_LOG_INTERVAL_SECONDS = 30.0
-_TURSO_SYNC_LOCK = threading.Lock()
-_LAST_TURSO_SYNC_MONOTONIC = 0.0
-_NEXT_TURSO_SYNC_RETRY_MONOTONIC = 0.0
-_LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC = 0.0
-_TURSO_CONNECTION_LOCAL = threading.local()
 LOGGER = logging.getLogger(__name__)
 _INIT_DB_LOCK = threading.Lock()
 _INITIALIZED_DB_TARGETS: set[str] = set()
@@ -272,7 +265,7 @@ def _is_missing_column_error(exc: Exception, column_name: str) -> bool:
 
 def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
     """
-    初始化 SQLite 数据库，创建 tasks 表和必要索引。
+    初始化数据库，创建 tasks 表和必要索引。
 
     Args:
         db_path: 数据库文件路径，默认使用项目根目录下 data/app.db。
@@ -282,41 +275,44 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
         if init_key in _INITIALIZED_DB_TARGETS:
             return
 
-        # Turso 场景优先使用本地 replica 快速校验，避免每次启动触发慢初始化。
-        if _should_use_turso(db_path) and _is_local_replica_schema_ready():
+        # PostgreSQL 场景优先检查是否已有 schema。
+        if _should_use_postgres(db_path) and _is_postgres_schema_ready(db_path):
             _INITIALIZED_DB_TARGETS.add(init_key)
             return
 
         with get_connection(db_path) as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    bilibili_url TEXT NOT NULL,
-                    video_title TEXT NOT NULL,
-                    video_duration_seconds INTEGER,
-                    audio_file_path TEXT,
-                    transcript_text TEXT,
-                    transcript_raw_text TEXT,
-                    summary_text TEXT,
-                    cancel_requested INTEGER NOT NULL DEFAULT 0,
-                    error_stage TEXT,
-                    error_code TEXT,
-                    error_message TEXT,
-                    error_updated_at DATETIME,
-                    status TEXT NOT NULL DEFAULT 'waiting',
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            if _should_use_postgres(db_path):
+                _init_postgres_schema(connection)
+            else:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        bilibili_url TEXT NOT NULL,
+                        video_title TEXT NOT NULL,
+                        video_duration_seconds INTEGER,
+                        audio_file_path TEXT,
+                        transcript_text TEXT,
+                        transcript_raw_text TEXT,
+                        summary_text TEXT,
+                        cancel_requested INTEGER NOT NULL DEFAULT 0,
+                        error_stage TEXT,
+                        error_code TEXT,
+                        error_message TEXT,
+                        error_updated_at DATETIME,
+                        status TEXT NOT NULL DEFAULT 'waiting',
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at DESC)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status)"
-            )
-            _commit_connection(connection, sync_remote=False)
-            _ensure_extra_columns(connection)
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at DESC)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status)"
+                )
+                _commit_connection(connection, sync_remote=False)
+                _ensure_extra_columns(connection)
 
         _INITIALIZED_DB_TARGETS.add(init_key)
 
@@ -344,13 +340,39 @@ def create_task(
         新任务的自增主键 ID。
     """
     normalized_status = _validate_status(status)
+    # 使用北京时间（而不是 SQLite 的 UTC CURRENT_TIMESTAMP）
+    beijing_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     with get_connection(db_path) as connection:
         try:
             cursor = connection.execute(
                 """
                 INSERT INTO tasks (
                     bilibili_url, video_title, video_duration_seconds, audio_file_path,
-                    transcript_text, summary_text, status, cancel_requested
+                    transcript_text, summary_text, status, cancel_requested, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    bilibili_url,
+                    video_title,
+                    video_duration_seconds,
+                    audio_file_path,
+                    None,
+                    None,
+                    normalized_status,
+                    0,
+                    beijing_time,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 兼容旧 schema（尚未添加 cancel_requested 列）
+            if "cancel_requested" not in str(exc):
+                raise
+            cursor = connection.execute(
+                """
+                INSERT INTO tasks (
+                    bilibili_url, video_title, video_duration_seconds, audio_file_path,
+                    transcript_text, summary_text, status, created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -362,29 +384,7 @@ def create_task(
                     None,
                     None,
                     normalized_status,
-                    0,
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            # 兼容旧 schema（尚未添加 cancel_requested 列）
-            if "cancel_requested" not in str(exc):
-                raise
-            cursor = connection.execute(
-                """
-                INSERT INTO tasks (
-                    bilibili_url, video_title, video_duration_seconds, audio_file_path,
-                    transcript_text, summary_text, status
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    bilibili_url,
-                    video_title,
-                    video_duration_seconds,
-                    audio_file_path,
-                    None,
-                    None,
-                    normalized_status,
+                    beijing_time,
                 ),
             )
         _commit_connection(connection, sync_remote=True)
@@ -1137,14 +1137,15 @@ def get_connection(
         db_path: 数据库文件路径。
 
     Yields:
-        可执行 SQL 的连接对象（sqlite/libsql/Cloudflare D1）。
+        可执行 SQL 的连接对象（SQLite/Cloudflare D1/PostgreSQL）。
     """
     should_close = False
     if _should_use_cloudflare_d1(db_path):
         connection = _connect_cloudflare_d1(db_path)
         should_close = True
-    elif _should_use_turso(db_path):
-        connection = _get_or_create_turso_connection(db_path)
+    elif _should_use_postgres(db_path):
+        connection = _connect_postgres(db_path)
+        should_close = True
     else:
         path = _normalize_db_path(db_path)
         connection = sqlite3.connect(
@@ -1211,59 +1212,110 @@ def _build_init_key(db_path: Path | str) -> str:
     if _should_use_cloudflare_d1(db_path):
         credentials = _resolve_cloudflare_d1_credentials(db_path)
         return f"d1::{credentials.account_id}::{credentials.database_id}"
-    if _should_use_turso(db_path):
-        url = _resolve_turso_url(db_path)
-        replica = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
-        return f"turso::{url}::{replica}"
+    if _should_use_postgres(db_path):
+        return f"postgres::{SUPABASE_POSTGRES_URL}"
     return f"sqlite::{_normalize_db_path(db_path)}"
 
 
-def _is_local_replica_schema_ready() -> bool:
-    """检查 Turso 本地 replica 是否已有完整 schema。"""
-    replica_path = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
-    if not replica_path.exists():
+_POSTGRES_REQUIRED_COLUMNS = {
+    "id",
+    "bilibili_url",
+    "video_title",
+    "video_duration_seconds",
+    "audio_file_path",
+    "transcript_text",
+    "transcript_raw_text",
+    "summary_text",
+    "cancel_requested",
+    "error_stage",
+    "error_code",
+    "error_message",
+    "error_updated_at",
+    "status",
+    "created_at",
+}
+
+
+def _is_postgres_schema_ready(db_path: Path | str) -> bool:
+    """检查 PostgreSQL 是否已有完整 tasks 表 schema。"""
+    if not _should_use_postgres(db_path):
         return False
-
-    required_columns = {
-        "id",
-        "bilibili_url",
-        "video_title",
-        "video_duration_seconds",
-        "audio_file_path",
-        "transcript_text",
-        "transcript_raw_text",
-        "summary_text",
-        "cancel_requested",
-        "error_stage",
-        "error_code",
-        "error_message",
-        "error_updated_at",
-        "status",
-        "created_at",
-        "transcription_progress",
-        "transcription_total_chunks",
-        "transcription_completed_chunks",
-    }
-    connection: Optional[sqlite3.Connection] = None
     try:
-        connection = sqlite3.connect(str(replica_path))
-        cursor = connection.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tasks'"
-        )
-        if int(cursor.fetchone()[0]) == 0:
-            return False
+        conn = _connect_postgres(db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_name = 'tasks'"
+            )
+            if int(cursor.fetchone()[0]) == 0:
+                return False
 
-        table_info = connection.execute("PRAGMA table_info(tasks)").fetchall()
-        columns = {str(row[1]) for row in table_info}
-        return required_columns.issubset(columns)
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'tasks'"
+            )
+            columns = {str(row[0]) for row in cursor.fetchall()}
+            return _POSTGRES_REQUIRED_COLUMNS.issubset(columns)
+        finally:
+            conn.close()
     except Exception:  # noqa: BLE001
         return False
-    finally:
-        if connection is not None:
-            try:
-                connection.close()
-            except Exception:  # noqa: BLE001
-                pass
+
+
+def _init_postgres_schema(connection: Any) -> None:
+    """初始化 PostgreSQL tasks 表 schema。"""
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY,
+            bilibili_url TEXT NOT NULL,
+            video_title TEXT NOT NULL,
+            video_duration_seconds INTEGER,
+            audio_file_path TEXT,
+            transcript_text TEXT,
+            transcript_raw_text TEXT,
+            summary_text TEXT,
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
+            error_stage TEXT,
+            error_code TEXT,
+            error_message TEXT,
+            error_updated_at TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'waiting',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status)"
+    )
+    connection.commit()
+    _ensure_extra_columns_postgres(connection)
+
+
+def _ensure_extra_columns_postgres(connection: Any) -> None:
+    """确保 PostgreSQL 表有额外列（兼容旧 schema）。"""
+    extra_columns = {
+        "transcription_progress": "TEXT",
+        "transcription_total_chunks": "INTEGER",
+        "transcription_completed_chunks": "INTEGER",
+    }
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'tasks'"
+    )
+    existing_columns = {str(row[0]) for row in cursor.fetchall()}
+
+    for col_name, col_type in extra_columns.items():
+        if col_name not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}"
+            )
+    connection.commit()
 
 
 def _is_remote_target(db_path: Path | str) -> bool:
@@ -1310,130 +1362,127 @@ def _connect_cloudflare_d1(db_path: Path | str) -> D1Connection:
     return D1Connection(credentials)
 
 
-def _should_use_turso(db_path: Path | str) -> bool:
+def _should_use_postgres(db_path: Path | str) -> bool:
+    """检查是否应使用 Supabase PostgreSQL。"""
     if _should_use_cloudflare_d1(db_path):
         return False
-    if _is_remote_target(db_path):
-        return True
-    if _is_default_db_path(db_path) and TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
+    if _is_default_db_path(db_path) and SUPABASE_POSTGRES_URL:
         return True
     return False
 
 
-def _resolve_turso_url(db_path: Path | str) -> str:
-    if _is_remote_target(db_path):
-        return str(db_path)
-    if TURSO_DATABASE_URL:
-        return TURSO_DATABASE_URL
-    raise RuntimeError("未配置 TURSO_DATABASE_URL，无法连接 Turso。")
+def _connect_postgres(db_path: Path | str) -> Any:
+    """创建 PostgreSQL 连接。
 
-
-def _connect_turso(db_path: Path | str) -> Any:
-    if libsql is None:
+    支持两种模式：
+    1. 有 SOCKS5_PROXY 环境变量且代理可用：使用 SOCKS5 代理连接（本地开发）
+    2. 无代理或代理不可用：直接连接 + SSL（Streamlit Cloud 等部署环境）
+    """
+    if psycopg2 is None:
         raise RuntimeError(
-            "已启用 Turso 连接，但未安装 libsql 依赖。请先执行: pip install libsql"
+            "已启用 PostgreSQL 连接，但未安装 psycopg2。请先执行: pip install psycopg2-binary"
         )
+    if not SUPABASE_POSTGRES_URL:
+        raise RuntimeError("未配置 SUPABASE_POSTGRES_URL，无法连接 PostgreSQL。")
 
-    turso_url = _resolve_turso_url(db_path)
-    auth_token = TURSO_AUTH_TOKEN
-    if not auth_token:
-        raise RuntimeError("已启用 Turso 连接，但缺少 TURSO_AUTH_TOKEN。")
+    from urllib.parse import urlparse
 
-    replica_path = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
-    connection = libsql.connect(
-        str(replica_path),
-        sync_url=turso_url,
-        auth_token=auth_token,
-    )
+    # 检查是否配置了 SOCKS5 代理
+    socks_proxy = os.getenv("SOCKS5_PROXY") or os.getenv("SOCKS_PROXY")
 
-    # 与本地 sqlite 行为保持一致，便于 row["field"] 访问。
-    if hasattr(connection, "row_factory"):
-        connection.row_factory = sqlite3.Row
-    return connection
+    # 解析 URL
+    parsed = urlparse(SUPABASE_POSTGRES_URL)
+    hostname = parsed.hostname
+    port = parsed.port or 5432
+    database = parsed.path.lstrip("/") or "postgres"
+    user = parsed.username or "postgres"
+    password = parsed.password or ""
 
-
-def _get_or_create_turso_connection(db_path: Path | str) -> Any:
-    """
-    获取当前线程复用的 Turso 连接，避免每次查询重复建连带来的高延迟。
-
-    说明：
-    - Streamlit 单个会话内的请求通常串行执行，线程内复用连接可显著降低页面读取耗时。
-    - 如果连接失效，会自动重建。
-    """
-    cache: Dict[str, Any] = getattr(_TURSO_CONNECTION_LOCAL, "connections", {})
-    cache_key = _build_turso_connection_cache_key(db_path)
-    connection = cache.get(cache_key)
-
-    if connection is not None:
+    def try_direct_connect():
+        """尝试直接连接（用于 Streamlit Cloud）"""
         try:
-            connection.execute("SELECT 1")
-            return connection
-        except Exception:  # noqa: BLE001
+            conn = psycopg2.connect(
+                host=hostname,
+                port=port,
+                database=database,
+                user=user,
+                password=password,
+                sslmode="require",
+            )
+            conn.autocommit = False
+            LOGGER.info(f"直接连接到 {hostname}:{port} (SSL)")
+            return conn
+        except Exception as exc:
+            raise RuntimeError(f"PostgreSQL 直接连接失败: {exc}") from exc
+
+    if socks_proxy and socks_proxy.startswith("socks5://"):
+        # 本地开发环境：尝试使用 SOCKS5 代理
+        import socks
+
+        proxy_parts = socks_proxy.replace("socks5://", "").split(":")
+        proxy_host = proxy_parts[0]
+        proxy_port = int(proxy_parts[1]) if len(proxy_parts) > 1 else 7890
+
+        try:
+            # 先测试 SOCKS5 代理是否可用
+            test_sock = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.set_proxy(socks.SOCKS5, proxy_host, proxy_port, True)
+            test_sock.settimeout(3)
+            test_sock.connect(("127.0.0.1", proxy_port))
+            test_sock.close()
+            proxy_available = True
+            LOGGER.info(f"SOCKS5 代理可用: {proxy_host}:{proxy_port}")
+        except Exception:
+            proxy_available = False
+            LOGGER.warning(f"SOCKS5 代理不可用，降级到直接连接")
+
+        if proxy_available:
+            # 使用 SOCKS5 代理连接
+            class Socks5Socket:
+                """包装 socket，通过 SOCKS5 代理连接"""
+                def __init__(self):
+                    self._sock = None
+
+                def __call__(self, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+                    if family != socket.AF_INET or type != socket.SOCK_STREAM:
+                        return socket.socket(family, type, proto)
+                    self._sock = socks.socksocket(family, type, proto)
+                    self._sock.set_proxy(socks.SOCKS5, proxy_host, proxy_port, True)
+                    self._sock.settimeout(30)
+                    return self._sock
+
+                def __getattr__(self, name):
+                    return getattr(self._sock, name)
+
+            original_socket = socket.socket
+            original_socket = socket.socket
             try:
-                connection.close()
-            except Exception:  # noqa: BLE001
-                pass
+                socket.socket = Socks5Socket()
+                conn = psycopg2.connect(
+                    host=hostname,
+                    port=port,
+                    database=database,
+                    user=user,
+                    password=password,
+                    sslmode="require",
+                )
+                conn.autocommit = False
+                LOGGER.info(f"通过 SOCKS5 代理连接到 {hostname}:{port}")
+                return conn
+            except Exception as exc:
+                LOGGER.warning(f"SOCKS5 代理连接失败: {exc}，尝试直接连接")
+                socket.socket = original_socket
+                return try_direct_connect()
+        else:
+            # 代理不可用，直接连接
+            return try_direct_connect()
 
-    connection = _connect_turso(db_path)
-    cache[cache_key] = connection
-    _TURSO_CONNECTION_LOCAL.connections = cache
-    return connection
-
-
-def _build_turso_connection_cache_key(db_path: Path | str) -> str:
-    """构造 Turso 连接缓存键，区分不同远端 URL 与本地 replica 路径。"""
-    turso_url = _resolve_turso_url(db_path)
-    replica_path = _normalize_db_path(TURSO_LOCAL_REPLICA_PATH)
-    return f"{turso_url}::{replica_path}"
+    # 无代理或非 SOCKS5 配置，直接连接
+    return try_direct_connect()
 
 
 def _commit_connection(connection: Any, sync_remote: bool) -> None:
     connection.commit()
-    if sync_remote and hasattr(connection, "sync"):
-        _sync_turso_if_needed(connection, force=False)
-
-
-def _sync_turso_if_needed(connection: Any, force: bool = False) -> None:
-    if not hasattr(connection, "sync"):
-        return
-
-    global _LAST_TURSO_SYNC_MONOTONIC  # noqa: PLW0603
-    global _NEXT_TURSO_SYNC_RETRY_MONOTONIC  # noqa: PLW0603
-    now = time.monotonic()
-    if not force and now < _NEXT_TURSO_SYNC_RETRY_MONOTONIC:
-        return
-    if not force and (now - _LAST_TURSO_SYNC_MONOTONIC) < TURSO_SYNC_INTERVAL_SECONDS:
-        return
-
-    with _TURSO_SYNC_LOCK:
-        now = time.monotonic()
-        if not force and now < _NEXT_TURSO_SYNC_RETRY_MONOTONIC:
-            return
-        if not force and (now - _LAST_TURSO_SYNC_MONOTONIC) < TURSO_SYNC_INTERVAL_SECONDS:
-            return
-        try:
-            connection.sync()
-            _LAST_TURSO_SYNC_MONOTONIC = time.monotonic()
-            _NEXT_TURSO_SYNC_RETRY_MONOTONIC = 0.0
-        except Exception as exc:  # noqa: BLE001
-            _NEXT_TURSO_SYNC_RETRY_MONOTONIC = (
-                time.monotonic() + TURSO_SYNC_FAILURE_BACKOFF_SECONDS
-            )
-            _log_turso_sync_failure(exc)
-
-
-def _log_turso_sync_failure(exc: Exception) -> None:
-    """Turso 同步失败时限流打印日志，避免刷屏。"""
-    global _LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC  # noqa: PLW0603
-    now = time.monotonic()
-    if (now - _LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC) < TURSO_SYNC_FAILURE_LOG_INTERVAL_SECONDS:
-        return
-
-    _LAST_TURSO_SYNC_ERROR_LOG_MONOTONIC = now
-    LOGGER.warning(
-        "Turso sync 失败，已降级使用本地 replica，稍后自动重试。错误：%s",
-        exc,
-    )
 
 
 def _validate_status(status: str) -> str:

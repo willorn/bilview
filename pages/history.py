@@ -289,15 +289,13 @@ def _format_status(status: str) -> str:
 
 
 def _format_created_at(raw_time: str) -> str:
+    """格式化任务创建时间为显示友好的格式。"""
     if not raw_time:
         return "-"
     normalized = raw_time.strip().replace("T", " ").replace("Z", "")
     try:
-        # 尝试解析为无时区的 ISO 格式，然后强制使用北京时区
+        # 解析为 datetime 对象并格式化为月-日 时:分
         parsed = datetime.fromisoformat(normalized)
-        beijing_tz = timezone(timedelta(hours=8))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=beijing_tz)
         return parsed.strftime("%m-%d %H:%M")
     except ValueError:
         return normalized[:16]

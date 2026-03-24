@@ -25,8 +25,14 @@ GROQ_API_KEY=your_groq_key
 
 默认是本地 SQLite。需要云端数据库时可选：
 
-1. Cloudflare D1（优先级最高）
-2. Turso
+1. Supabase PostgreSQL（推荐）
+2. Cloudflare D1
+
+### Supabase PostgreSQL
+
+```env
+SUPABASE_POSTGRES_URL=postgresql://postgres:your_password@db.your-project.supabase.co:5432/postgres
+```
 
 ### Cloudflare D1
 
@@ -34,13 +40,6 @@ GROQ_API_KEY=your_groq_key
 CLOUDFLARE_ACCOUNT_ID=your_account_id
 CLOUDFLARE_D1_DATABASE_ID=your_database_id
 CLOUDFLARE_API_TOKEN=your_api_token
-```
-
-### Turso
-
-```env
-TURSO_DATABASE_URL=libsql://xxx.turso.io
-TURSO_AUTH_TOKEN=your_turso_token
 ```
 
 ## 默认配置代码位置

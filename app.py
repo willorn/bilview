@@ -993,6 +993,68 @@ def _has_active_tasks() -> bool:
         return False
 
 
+# 任务刚完成时保持轮询的秒数
+_COMPLETED_REFRESH_GRACE_PERIOD = 15
+
+
+def _has_just_finished_tasks() -> bool:
+    """检查是否有任务刚完成（在 grace period 内），需要继续轮询刷新显示结果。"""
+    try:
+        tasks = list_tasks(limit=100, include_content=False)
+        finished_statuses = {
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.TIMEOUT.value,
+            TaskStatus.CANCELLED.value,
+        }
+        finished_tasks = [t for t in tasks if t.status in finished_statuses]
+        if not finished_tasks:
+            return False
+
+        # 检查是否有任务在最近 _COMPLETED_REFRESH_GRACE_PERIOD 秒内完成
+        import time
+        now = time.time()
+        grace_key = "task_finish_timestamps"
+        if grace_key not in st.session_state:
+            st.session_state[grace_key] = {}
+
+        # 清理过期的记录
+        stale_threshold = now - _COMPLETED_REFRESH_GRACE_PERIOD * 2
+        st.session_state[grace_key] = {
+            k: v for k, v in st.session_state[grace_key].items()
+            if v > stale_threshold
+        }
+
+        # 检查是否有新完成的任务
+        for task in finished_tasks:
+            task_key = str(task.id)
+            # 使用 updated_at 或 created_at 判断（优先 updated_at）
+            finish_time_str = getattr(task, "updated_at", None) or task.created_at
+            # 解析时间（格式如 "2026-03-24 10:30:00" 或 ISO 格式）
+            try:
+                from datetime import datetime
+                if "T" in finish_time_str:
+                    finish_time = datetime.fromisoformat(finish_time_str.replace("Z", "+00:00")).timestamp()
+                else:
+                    finish_time = datetime.strptime(finish_time_str, "%Y-%m-%d %H:%M:%S").timestamp()
+            except Exception:
+                finish_time = 0
+
+            # 如果任务在 grace period 内完成
+            if now - finish_time <= _COMPLETED_REFRESH_GRACE_PERIOD:
+                # 记录第一次发现的时间戳，避免重复触发
+                if st.session_state[grace_key].get(task_key, 0) == 0:
+                    st.session_state[grace_key][task_key] = finish_time
+                return True
+            else:
+                # 已超过 grace period，移除记录
+                st.session_state[grace_key].pop(task_key, None)
+
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @st.fragment
 def _auto_refresh_fragment() -> None:
     """
@@ -1002,8 +1064,9 @@ def _auto_refresh_fragment() -> None:
     - 任务全部完成后自动停止刷新。
     """
     has_active = _has_active_tasks()
+    has_just_finished = _has_just_finished_tasks()
 
-    if has_active:
+    if has_active or has_just_finished:
         st.query_params["__ar"] = "1"
     elif "__ar" in st.query_params:
         del st.query_params["__ar"]

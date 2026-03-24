@@ -22,12 +22,9 @@ STORAGE_ROOT = Path(
 DATA_DIR = STORAGE_ROOT / "data"
 DOWNLOAD_DIR = STORAGE_ROOT / "downloads"
 DB_PATH = DATA_DIR / "app.db"
-TURSO_LOCAL_REPLICA_PATH = Path(
-    os.getenv("TURSO_LOCAL_REPLICA_PATH", DATA_DIR / "turso_replica.db")
-).expanduser().resolve()
 
-DEFAULT_LLM_API_URL = "https://x666.me/v1/chat/completions"
-DEFAULT_LLM_MODEL = "gemini-2.5-pro-1m"
+DEFAULT_LLM_API_URL = "https://yunwu.ai/v1/chat/completions"
+DEFAULT_LLM_MODEL = "gemini-3.1-pro-preview"
 
 # 重试配置
 RETRY_MAX_ATTEMPTS_DOWNLOAD = 3  # 下载最大重试次数
@@ -93,16 +90,17 @@ def _merge_unique_keys(*groups: List[str]) -> List[str]:
 
 # 项目内默认使用的 key（可在 .env 中覆盖）
 X666_API_KEY = get_api_key("X666_API_KEY")
+YUNWU_API_KEY = get_api_key("YUNWU_API_KEY")
 GROQ_API_KEY = get_api_key("GROQ_API_KEY")
 GROQ_API_KEYS = _merge_unique_keys(
     get_api_keys("GROQ_API_KEYS"),
     [GROQ_API_KEY] if GROQ_API_KEY else [],
 )
-TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 CLOUDFLARE_D1_DATABASE_ID = os.getenv("CLOUDFLARE_D1_DATABASE_ID")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+SUPABASE_POSTGRES_URL = os.getenv("SUPABASE_POSTGRES_URL")
+SOCKS5_PROXY = os.getenv("SOCKS5_PROXY")
 DB_AUTO_INIT_ON_STARTUP = _env_bool("DB_AUTO_INIT_ON_STARTUP", default=False)
 DEFAULT_ASR_PROVIDER = os.getenv("ASR_PROVIDER", "groq").strip().lower() or "groq"
 DEFAULT_GROQ_ASR_BASE_URL = (

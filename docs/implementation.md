@@ -40,7 +40,7 @@ BilView 是一个 B 站视频知识提炼工具，核心流程为：
 | 语音转写 | Groq Whisper API | 云端 Whisper，速度快 |
 | 本地标点 | punctuator.py | 纯规则补标点，不调 API |
 | 总结生成 | x666.me LLM API | 支持 gemini/gpt 等模型 |
-| 数据持久化 | SQLite + Turso/D1（可选） | 任务状态与历史记录 |
+| 数据持久化 | SQLite + Supabase/D1（可选） | 任务状态与历史记录 |
 | 部署平台 | Streamlit Cloud / Render | 托管运行 |
 
 ---
@@ -61,7 +61,7 @@ bilview/
 │   └── summarizer.py         # LLM 总结调用
 │
 ├── db/
-│   └── database.py           # SQLite 持久化 + Turso/D1 支持
+│   └── database.py           # SQLite 持久化 + Supabase/D1 支持
 │
 ├── pages/
 │   └── history.py            # 历史记录页面
@@ -232,7 +232,8 @@ temperature: 0.2（低随机性）
 
 ### 5.1 表结构
 
-```sql
+```text
+-- SQLite schema (仅供参考)
 CREATE TABLE tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bilibili_url TEXT NOT NULL,          -- B 站原始链接
@@ -274,7 +275,7 @@ waiting → downloading → transcribing → summarizing → completed
 | 后端 | 说明 |
 |------|------|
 | SQLite（默认） | 本地文件，性能好，适合单机部署 |
-| Turso | libsql 协议，支持本地 replica 同步 |
+| Supabase PostgreSQL | 云端数据库，推荐用于 Streamlit Cloud 部署 |
 | Cloudflare D1 | HTTP API，需要 CF 凭据 |
 
 ---
@@ -362,10 +363,8 @@ DB_PATH = DATA_DIR/app.db
 ### 7.3 云数据库配置
 
 ```env
-# Turso
-TURSO_DATABASE_URL=libsql://xxx.turso.io
-TURSO_AUTH_TOKEN=xxx
-TURSO_LOCAL_REPLICA_PATH=./data/turso_replica.db
+# Supabase PostgreSQL
+SUPABASE_POSTGRES_URL=postgresql://postgres:your_password@db.your-project.supabase.co:5432/postgres
 
 # Cloudflare D1
 CLOUDFLARE_ACCOUNT_ID=xxx
@@ -435,5 +434,4 @@ CLOUDFLARE_API_TOKEN=xxx
 | `yt-dlp` | ≥2024.12 | B 站视频下载 |
 | `openai` | ≥1.54 | Groq API 客户端 |
 | `pydub` | ≥0.25 | 音频分片处理 |
-| `libsql` | ≥0.1 | Turso 数据库（可选）|
 | `tenacity` | ≥8.2 | 自动重试装饰器 |

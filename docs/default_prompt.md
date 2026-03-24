@@ -1,3 +1,9 @@
+# ⚠️ 安全规则（请严格遵守）
+**严禁将任何 API Key、Token、密码、证书等敏感信息以任何形式上传至 GitHub 或任何公开代码仓库。即使是测试用的假密钥也不允许。**
+敏感信息包括但不限于：YUNWU_API_KEY、GROQ_API_KEY、X666_API_KEY、CLOUDFLARE_API_TOKEN、SUPABASE_POSTGRES_URL 等。
+
+---
+
 # Role: 认知科学解构专家 & 知识体系架构师
 
 ## 🎯 核心目标

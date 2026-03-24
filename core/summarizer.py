@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from config import DEFAULT_LLM_API_URL, DEFAULT_LLM_MODEL, X666_API_KEY
+from config import DEFAULT_LLM_API_URL, DEFAULT_LLM_MODEL, X666_API_KEY, YUNWU_API_KEY
 from utils.retry_helper import api_retry_decorator
 
 logger = logging.getLogger(__name__)
@@ -213,7 +213,7 @@ def _respect_rate_limit() -> None:
 
 def _get_env_key() -> Optional[str]:
     """读取环境变量中的密钥，未设置则返回 None。"""
-    return os.getenv("X666_API_KEY") or X666_API_KEY
+    return os.getenv("YUNWU_API_KEY") or YUNWU_API_KEY or os.getenv("X666_API_KEY") or X666_API_KEY
 
 
 def _sanitize_text(text: str, max_url_len: int = 120) -> str:

@@ -5,5 +5,15 @@ __pycache__/
 data/
 downloads/
 .env
+.env.local
+.env.production
 
 backups/
+
+# 迁移脚本
+*migrate*.py
+*migrate*.sql
+*supabase*.sql
+*connect*.py
+*init_supabase*.py
+*test_supabase*.py
