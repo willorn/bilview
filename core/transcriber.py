@@ -5,13 +5,16 @@
 1. 默认使用 Groq 语音识别（可通过 provider 切换到本地 Whisper）。
 2. 当音频超过指定时长/体积时，利用 pydub 先切片，再逐段调用识别引擎并拼接结果。
 3. 依赖 ffmpeg（已存在于环境中）完成音频解码。
+4. 切片并行转录以提升性能。
 
 @author 开发
 @date 2026-03-04
-@version v2.0
+@version v3.0
 """
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -30,6 +33,7 @@ FILE_SIZE_LIMIT_MB = 25
 GROQ_CHUNK_FORMAT = "mp3"
 GROQ_CHUNK_SUFFIX = ".mp3"
 GROQ_CHUNK_BITRATE = "64k"
+MAX_PARALLEL_CHUNKS = 4  # 最大并行转录切片数
 
 
 def audio_to_text(
@@ -100,27 +104,36 @@ def audio_to_text(
 
         segments = _split_audio(audio, chunk_duration_sec)
         total_chunks = len(segments)
-        texts: List[str] = []
         chunk_format = GROQ_CHUNK_FORMAT
         chunk_suffix = GROQ_CHUNK_SUFFIX
         export_kwargs = {"bitrate": GROQ_CHUNK_BITRATE}
 
         # 断点续传：跳过已完成切片
+        completed_texts: Dict[int, str] = {}
         start_index = 0
         if resume_from_chunks:
-            completed_chunks = sorted(
-                [chunk for chunk in resume_from_chunks if chunk.get("completed")],
-                key=lambda chunk: int(chunk.get("index", 0)),
-            )
-            completed_texts = [c["text"] for c in completed_chunks if c.get("text")]
-            texts.extend(completed_texts)
-            start_index = len(completed_chunks)
+            for chunk in resume_from_chunks:
+                if chunk.get("completed") and chunk.get("text"):
+                    idx = int(chunk.get("index", 0))
+                    completed_texts[idx] = chunk["text"]
+            if completed_texts:
+                start_index = max(completed_texts.keys()) + 1
 
-        for i in range(start_index, total_chunks):
-            segment = segments[i]
-            start_sec = i * chunk_duration_sec
-            end_sec = min((i + 1) * chunk_duration_sec, audio.duration_seconds)
+        # 需要转录的切片索引
+        remaining_indices = [i for i in range(start_index, total_chunks) if i not in completed_texts]
 
+        if not remaining_indices:
+            # 所有切片都已完成
+            texts = [completed_texts[i] for i in range(total_chunks) if i in completed_texts]
+            result = " ".join(filter(None, texts)).strip()
+            if progress_callback:
+                progress_callback(total_chunks, total_chunks, result, 0, audio.duration_seconds)
+            return result
+
+        # 并行转录剩余切片
+        def _transcribe_chunk(segment: AudioSegment, index: int) -> tuple[int, str]:
+            start_sec = index * chunk_duration_sec
+            end_sec = min((index + 1) * chunk_duration_sec, audio.duration_seconds)
             with NamedTemporaryFile(suffix=chunk_suffix, delete=False) as tmp_file:
                 temp_path = Path(tmp_file.name)
             try:
@@ -133,14 +146,33 @@ def audio_to_text(
                 )
             finally:
                 temp_path.unlink(missing_ok=True)
+            return (index, chunk_text, start_sec, end_sec)
 
-            texts.append(chunk_text)
+        # 使用线程池并行转录
+        results: Dict[int, tuple[str, float, float]] = {}
+        completed_count = len(completed_texts)
 
-            # 触发进度回调
-            if progress_callback:
-                progress_callback(i + 1, total_chunks, chunk_text, start_sec, end_sec)
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_CHUNKS, len(remaining_indices))) as executor:
+            future_to_index = {
+                executor.submit(_transcribe_chunk, segments[i], i): i
+                for i in remaining_indices
+            }
+            for future in as_completed(future_to_index):
+                idx, chunk_text, start_sec, end_sec = future.result()
+                results[idx] = (chunk_text, start_sec, end_sec)
+                completed_count += 1
+                if progress_callback:
+                    progress_callback(completed_count, total_chunks, chunk_text, start_sec, end_sec)
 
-        return " ".join(filter(None, texts)).strip()
+        # 按顺序拼接结果
+        all_texts = []
+        for i in range(total_chunks):
+            if i in completed_texts:
+                all_texts.append(completed_texts[i])
+            elif i in results:
+                all_texts.append(results[i][0])
+
+        return " ".join(filter(None, all_texts)).strip()
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"音频转文字失败：{exc}") from exc
 

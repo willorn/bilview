@@ -1564,7 +1564,7 @@ def update_transcription_progress(
         completed_count = sum(1 for c in progress["chunks"] if c["completed"])
         progress["completed_chunks"] = completed_count
 
-        # 写回数据库
+        # 写回数据库（异步同步到远程，不阻塞主流程）
         connection.execute(
             """
             UPDATE tasks
@@ -1575,7 +1575,7 @@ def update_transcription_progress(
             """,
             (json.dumps(progress, ensure_ascii=False), total_chunks, completed_count, task_id)
         )
-        _commit_connection(connection, sync_remote=True)
+        _commit_connection(connection, sync_remote=False)
 
 
 def get_transcription_progress(

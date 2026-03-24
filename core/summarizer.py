@@ -2,14 +2,14 @@
 模块描述：调用外部大模型接口（x666.me / gemini-2.5-pro-1m）对长转录文本进行总结。
 
 特点与约束：
-1. 采用同步 HTTP 请求，默认 20 秒速率限制（简单全局限流）。
+1. 采用同步 HTTP 请求，Token Bucket 速率限制（允许适度突发）。
 2. 支持自定义 System Prompt、温度、模型名与超时。
 3. 支持从环境变量 `X666_API_KEY` 读取密钥，若缺省则使用文档提供的默认 key。
 4. 自动重试机制：区分可重试错误（429/5xx/网络）和不可重试错误（4xx），使用指数退避策略。
 
 @author 开发
 @date 2026-02-23
-@version v1.1 (新增重试机制)
+@version v2.0 (Token Bucket 限速，支持适度突发)
 """
 from __future__ import annotations
 
@@ -34,7 +34,8 @@ DEFAULT_MODEL = DEFAULT_LLM_MODEL
 DEFAULT_API_KEY = None  # 不再内置默认密钥，必须由环境变量或显式传入
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TIMEOUT_SECONDS = 150
-RATE_LIMIT_SECONDS = 20
+RATE_LIMIT_SECONDS = 10  # Token Bucket 补充间隔（秒）
+BURST_SIZE = 3  # 允许的突发请求数
 DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent.parent / "docs" / "default_prompt.md"
 _FALLBACK_SYSTEM_PROMPT = """你是一个专业的长视频笔记助手，请将输入的完整转录文本，提炼为结构化笔记，需包含：
 1) 内容摘要：3-5 条
@@ -42,8 +43,43 @@ _FALLBACK_SYSTEM_PROMPT = """你是一个专业的长视频笔记助手，请将
 3) 结论与行动建议：2-3 条
 要求：用中文输出；保持事实准确，不臆测；必要时保留数字、公式或关键引用。"""
 
-_lock = threading.Lock()
-_last_call_ts = 0.0
+
+class _TokenBucket:
+    """线程安全的 Token Bucket 实现，支持适度突发。"""
+
+    def __init__(self, rate: float, capacity: int):
+        self._rate = rate  # 每秒补充的 token 数
+        self._capacity = capacity  # 桶容量
+        self._tokens = float(capacity)
+        self._last_update = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, timeout: float = 60) -> bool:
+        """获取一个 token，超时返回 False。"""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                self._refill_locked()
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # 等待到下一个 token 可用或超时
+            wait_time = min((1 - self._tokens) / self._rate, remaining)
+            if wait_time > 0:
+                time.sleep(min(wait_time, 0.1))  # 最多等 0.1 秒再检查
+
+    def _refill_locked(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_update
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+        self._last_update = now
+
+
+# 全局 Token Bucket：允许适度突发而非严格串行
+_bucket = _TokenBucket(rate=1.0 / RATE_LIMIT_SECONDS, capacity=BURST_SIZE)
 
 
 def _load_default_system_prompt(prompt_path: Path = DEFAULT_PROMPT_PATH) -> str:
@@ -166,14 +202,9 @@ def _call_api(payload: dict, api_key: str, timeout: int, api_url: str) -> str:
 
 
 def _respect_rate_limit() -> None:
-    """简单全局速率限制：两次调用间隔至少 RATE_LIMIT_SECONDS。"""
-    global _last_call_ts
-    with _lock:
-        now = time.time()
-        wait_for = _last_call_ts + RATE_LIMIT_SECONDS - now
-        if wait_for > 0:
-            time.sleep(wait_for)
-        _last_call_ts = time.time()
+    """Token Bucket 速率限制：允许最多 BURST_SIZE 个突发请求。"""
+    if not _bucket.acquire(timeout=60):
+        raise RuntimeError("API 速率限制超时：请减少并发请求数")
 
 
 def _get_env_key() -> Optional[str]:

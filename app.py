@@ -401,7 +401,7 @@ def _read_positive_float_config(name: str, default: float) -> float:
         return max(float(default), 0.2)
 
 
-TASK_EXECUTOR_MAX_WORKERS = _read_positive_int_config("TASK_EXECUTOR_MAX_WORKERS", 1)
+TASK_EXECUTOR_MAX_WORKERS = _read_positive_int_config("TASK_EXECUTOR_MAX_WORKERS", 4)
 TASK_EXECUTOR_POLL_INTERVAL_SECONDS = _read_positive_float_config("TASK_EXECUTOR_POLL_INTERVAL_SECONDS", 1.0)
 TASK_EXECUTOR_TASK_TIMEOUT_SECONDS = _read_positive_float_config("TASK_EXECUTOR_TASK_TIMEOUT_SECONDS", 5400.0)
 TASK_EXECUTOR_TIMEOUT_OVERFLOW_WORKERS = _read_non_negative_int_config(
